@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9
+        http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">
+
+  <!-- Homepage -->
+  <url>
+    <loc>{{ base_url }}</loc>
+    <lastmod>{{ generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+
+  <!-- Business Pages -->
+  {% for page in pages %}
+  <url>
+    <loc>{{ base_url }}/pages/{{ page.slug }}.html</loc>
+    <lastmod>{{ page.generated_at | strftime('%Y-%m-%d') if page.generated_at else generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>{{ page.priority | default(0.8) }}</priority>
+    {% if page.images %}
+    {% for image in page.images %}
+    <image:image>
+      <image:loc>{{ base_url }}/{{ image.url }}</image:loc>
+      <image:caption>{{ image.caption | default(page.business_name + ' - ' + page.category) }}</image:caption>
+    </image:image>
+    {% endfor %}
+    {% endif %}
+  </url>
+  {% endfor %}
+
+  <!-- Category Pages (if implemented) -->
+  {% for category in categories %}
+  <url>
+    <loc>{{ base_url }}/category/{{ category.slug }}.html</loc>
+    <lastmod>{{ generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  {% endfor %}
+
+  <!-- Location Pages (if implemented) -->
+  {% for location in locations %}
+  <url>
+    <loc>{{ base_url }}/location/{{ location.slug }}.html</loc>
+    <lastmod>{{ generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  {% endfor %}
+
+  <!-- Static Pages -->
+  <url>
+    <loc>{{ base_url }}/about.html</loc>
+    <lastmod>{{ generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.5</priority>
+  </url>
+
+  <url>
+    <loc>{{ base_url }}/privacy.html</loc>
+    <lastmod>{{ generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>yearly</changefreq>
+    <priority>0.3</priority>
+  </url>
+
+  <url>
+    <loc>{{ base_url }}/terms.html</loc>
+    <lastmod>{{ generation_date | strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>yearly</changefreq>
+    <priority>0.3</priority>
+  </url>
+
+</urlset>

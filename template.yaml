@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Agentic Local SEO Content Factory - Serverless infrastructure for automated SEO page generation'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for Bedrock service
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        BEDROCK_REGION: !Ref BedrockRegion
+        RAW_BUCKET: !Ref RawDataBucket
+        PROCESSED_BUCKET: !Ref ProcessedDataBucket
+        WEBSITE_BUCKET: !Ref WebsiteBucket
+        GLUE_DATABASE: !Ref GlueDatabase
+        ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+
+Resources:
+  # S3 Buckets
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-raw-data-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-processed-data-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-website-${AWS::AccountId}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket}/*'
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${AWS::StackName}_seo_content_db'
+        Description: 'Database for SEO content factory data'
+
+  # Glue Crawler
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${AWS::StackName}-raw-data-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub '${RawDataBucket}/businesses/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+
+  # Athena Workgroup
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-workgroup'
+      Description: 'Workgroup for SEO content factory queries'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${ProcessedDataBucket}/athena-results/'
+
+  # Lambda Functions
+  IngestRawFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ingest-raw'
+      CodeUri: lambdas/ingest_raw/
+      Handler: app.lambda_handler
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref RawDataBucket
+
+  CleanTransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-clean-transform'
+      CodeUri: lambdas/clean_transform/
+      Handler: app.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref RawDataBucket
+        - S3FullAccessPolicy:
+            BucketName: !Ref ProcessedDataBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - glue:GetTable
+                - glue:GetDatabase
+              Resource: '*'
+
+  AgentGenerateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-agent-generate'
+      CodeUri: lambdas/agent_generate/
+      Handler: app.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref ProcessedDataBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+
+  AgentQcFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-agent-qc'
+      CodeUri: lambdas/agent_qc/
+      Handler: app.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref ProcessedDataBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+
+  RenderHtmlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-render-html'
+      CodeUri: lambdas/render_html/
+      Handler: app.lambda_handler
+      Timeout: 600
+      MemorySize: 1024
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref ProcessedDataBucket
+        - S3FullAccessPolicy:
+            BucketName: !Ref WebsiteBucket
+
+  PublishSiteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-publish-site'
+      CodeUri: lambdas/publish_site/
+      Handler: app.lambda_handler
+      Timeout: 600
+      MemorySize: 1024
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref ProcessedDataBucket
+        - S3FullAccessPolicy:
+            BucketName: !Ref WebsiteBucket
+
+  # Step Functions State Machine
+  ContentGenerationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${AWS::StackName}-content-generation'
+      DefinitionUri: statemachine/definition.asl.json
+      DefinitionSubstitutions:
+        IngestRawFunctionArn: !GetAtt IngestRawFunction.Arn
+        CleanTransformFunctionArn: !GetAtt CleanTransformFunction.Arn
+        AgentGenerateFunctionArn: !GetAtt AgentGenerateFunction.Arn
+        AgentQcFunctionArn: !GetAtt AgentQcFunction.Arn
+        RenderHtmlFunctionArn: !GetAtt RenderHtmlFunction.Arn
+        PublishSiteFunctionArn: !GetAtt PublishSiteFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IngestRawFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CleanTransformFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AgentGenerateFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AgentQcFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RenderHtmlFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PublishSiteFunction
+
+Outputs:
+  RawDataBucket:
+    Description: 'S3 bucket for raw business data'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucket:
+    Description: 'S3 bucket for processed data and generated content'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  WebsiteBucket:
+    Description: 'S3 bucket for published website'
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteBucket'
+
+  WebsiteUrl:
+    Description: 'URL of the published website'
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteUrl'
+
+  GlueDatabase:
+    Description: 'Glue database for data catalog'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  AthenaWorkgroup:
+    Description: 'Athena workgroup for queries'
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  StateMachineArn:
+    Description: 'Step Functions state machine ARN'
+    Value: !Ref ContentGenerationStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'

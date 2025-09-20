@@ -1,0 +1,348 @@
+{% extends "base.html" %}
+
+{% block title %}{{ business.name }} - {{ business.category }} in {{ business.city }}, {{ business.state }}{% endblock %}
+
+{% block meta_description %}{{ seo.meta_description }}{% endblock %}
+
+{% block meta_keywords %}
+<meta name="keywords" content="{{ seo.keywords | join(', ') }}">
+{% endblock %}
+
+{% block canonical %}
+<link rel="canonical" href="{{ seo.canonical_url if seo.canonical_url else request.url }}">
+{% endblock %}
+
+{% block og_type %}business.business{% endblock %}
+{% block og_title %}{{ seo.title }}{% endblock %}
+{% block og_description %}{{ seo.meta_description }}{% endblock %}
+
+{% block structured_data %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "LocalBusiness",
+  "name": "{{ business.name }}",
+  "description": "{{ business.description or seo.meta_description }}",
+  "url": "{{ business.website if business.website else request.url }}",
+  "telephone": "{{ business.phone }}",
+  "email": "{{ business.email }}",
+  "address": {
+    "@type": "PostalAddress",
+    "streetAddress": "{{ business.address }}",
+    "addressLocality": "{{ business.city }}",
+    "addressRegion": "{{ business.state }}",
+    "postalCode": "{{ business.zip_code }}",
+    "addressCountry": "US"
+  },
+  "geo": {
+    "@type": "GeoCoordinates",
+    "addressCountry": "US"
+  },
+  {% if business.rating %}
+  "aggregateRating": {
+    "@type": "AggregateRating",
+    "ratingValue": "{{ business.rating }}",
+    "reviewCount": "{{ business.review_count or 1 }}",
+    "bestRating": "5",
+    "worstRating": "1"
+  },
+  {% endif %}
+  "priceRange": "$$",
+  "openingHoursSpecification": [
+    {
+      "@type": "OpeningHoursSpecification",
+      "dayOfWeek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+      "opens": "09:00",
+      "closes": "17:00"
+    }
+  ]
+}
+</script>
+{% endblock %}
+
+{% block body_class %}business-page{% endblock %}
+
+{% block breadcrumbs %}
+<nav class="breadcrumbs" aria-label="Breadcrumb navigation">
+  <div class="container">
+    <ol class="breadcrumb-list">
+      <li class="breadcrumb-item"><a href="/">Home</a></li>
+      <li class="breadcrumb-item"><a href="/#{{ business.category | lower | replace(' ', '-') }}">{{ business.category }}</a></li>
+      <li class="breadcrumb-item"><a href="/#{{ business.city | lower | replace(' ', '-') }}">{{ business.city }}</a></li>
+      <li class="breadcrumb-item active" aria-current="page">{{ business.name }}</li>
+    </ol>
+  </div>
+</nav>
+{% endblock %}
+
+{% block content %}
+<article class="business-listing" itemscope itemtype="https://schema.org/LocalBusiness">
+  <!-- Business Header -->
+  <header class="business-header">
+    <div class="business-hero">
+      <h1 class="business-title" itemprop="name">{{ seo.h1 }}</h1>
+
+      <div class="business-meta">
+        <div class="business-info-grid">
+          <div class="info-item">
+            <span class="info-label">Category:</span>
+            <span class="info-value" itemprop="category">{{ business.category }}</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Location:</span>
+            <span class="info-value" itemprop="address" itemscope itemtype="https://schema.org/PostalAddress">
+              <span itemprop="addressLocality">{{ business.city }}</span>,
+              <span itemprop="addressRegion">{{ business.state }}</span>
+            </span>
+          </div>
+          {% if business.rating %}
+          <div class="info-item rating-item">
+            <span class="info-label">Rating:</span>
+            <div class="rating-display" itemprop="aggregateRating" itemscope itemtype="https://schema.org/AggregateRating">
+              <div class="stars" aria-label="{{ business.rating }} out of 5 stars">
+                {% for i in range(5) %}
+                  <span class="star {{ 'filled' if i < business.rating|round else 'empty' }}">★</span>
+                {% endfor %}
+              </div>
+              <span class="rating-text">
+                <span itemprop="ratingValue">{{ business.rating }}</span>/5.0
+                {% if business.review_count %}
+                  (<span itemprop="reviewCount">{{ business.review_count }}</span> reviews)
+                {% endif %}
+              </span>
+            </div>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Business Content -->
+  <div class="business-content">
+    <!-- Introduction -->
+    <section class="content-section introduction">
+      <div class="content-text">
+        {{ content.introduction | replace('\n', '<br>') | safe }}
+      </div>
+    </section>
+
+    <!-- Main Content -->
+    <section class="content-section main-content">
+      <div class="content-text">
+        {{ content.main_content | replace('\n\n', '</p><p>') | replace('\n', '<br>') | safe | replace('<p>', '<p>') }}
+      </div>
+    </section>
+
+    <!-- Services Section -->
+    {% if content.services_section %}
+    <section class="content-section services">
+      <h2>Our Services</h2>
+      <div class="content-text">
+        {{ content.services_section | replace('\n', '<br>') | safe }}
+      </div>
+    </section>
+    {% endif %}
+
+    <!-- Location & Service Area -->
+    {% if content.location_section %}
+    <section class="content-section location">
+      <h2>Location & Service Area</h2>
+      <div class="content-text">
+        {{ content.location_section | replace('\n', '<br>') | safe }}
+      </div>
+    </section>
+    {% endif %}
+
+    <!-- Contact Information -->
+    <section class="content-section contact">
+      <h2>Contact {{ business.name }}</h2>
+      <div class="contact-card">
+        <div class="contact-details">
+          <div class="contact-item address-item" itemprop="address" itemscope itemtype="https://schema.org/PostalAddress">
+            <div class="contact-icon">📍</div>
+            <div class="contact-info">
+              <strong>Address:</strong><br>
+              <span itemprop="streetAddress">{{ business.address }}</span><br>
+              <span itemprop="addressLocality">{{ business.city }}</span>,
+              <span itemprop="addressRegion">{{ business.state }}</span>
+              <span itemprop="postalCode">{{ business.zip_code }}</span>
+            </div>
+          </div>
+
+          {% if business.phone %}
+          <div class="contact-item phone-item">
+            <div class="contact-icon">📞</div>
+            <div class="contact-info">
+              <strong>Phone:</strong><br>
+              <a href="tel:{{ business.phone | replace(' ', '') | replace('(', '') | replace(')', '') | replace('-', '') }}"
+                 itemprop="telephone" class="phone-link">{{ business.phone }}</a>
+            </div>
+          </div>
+          {% endif %}
+
+          {% if business.website %}
+          <div class="contact-item website-item">
+            <div class="contact-icon">🌐</div>
+            <div class="contact-info">
+              <strong>Website:</strong><br>
+              <a href="{{ business.website }}" target="_blank" rel="noopener" itemprop="url" class="website-link">
+                Visit Website
+              </a>
+            </div>
+          </div>
+          {% endif %}
+
+          {% if business.email %}
+          <div class="contact-item email-item">
+            <div class="contact-icon">✉️</div>
+            <div class="contact-info">
+              <strong>Email:</strong><br>
+              <a href="mailto:{{ business.email }}" itemprop="email" class="email-link">{{ business.email }}</a>
+            </div>
+          </div>
+          {% endif %}
+        </div>
+
+        <!-- Call-to-Action Buttons -->
+        <div class="contact-actions">
+          {% if business.phone %}
+          <a href="tel:{{ business.phone | replace(' ', '') | replace('(', '') | replace(')', '') | replace('-', '') }}"
+             class="cta-button cta-primary">
+            📞 Call Now
+          </a>
+          {% endif %}
+          {% if business.website %}
+          <a href="{{ business.website }}" target="_blank" rel="noopener" class="cta-button cta-secondary">
+            🌐 Visit Website
+          </a>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    <!-- Related Businesses -->
+    {% if internal_links %}
+    <section class="content-section related-businesses">
+      <h2>Related Local Businesses</h2>
+      <div class="related-grid">
+        {% for link in internal_links %}
+        <div class="related-item">
+          <a href="{{ link.url }}" class="related-link">
+            <div class="related-content">
+              <h3>{{ link.anchor_text }}</h3>
+              <p>Discover more local businesses in {{ business.city }}.</p>
+            </div>
+          </a>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <!-- Conclusion -->
+    <section class="content-section conclusion">
+      <div class="content-text">
+        {{ content.conclusion | replace('\n', '<br>') | safe }}
+      </div>
+    </section>
+
+    <!-- FAQ Section (Template for future enhancement) -->
+    <section class="content-section faq-preview" style="display: none;">
+      <h2>Frequently Asked Questions</h2>
+      <div class="faq-item" itemscope itemprop="mainEntity" itemtype="https://schema.org/Question">
+        <h3 itemprop="name">What services does {{ business.name }} offer?</h3>
+        <div itemscope itemprop="acceptedAnswer" itemtype="https://schema.org/Answer">
+          <div itemprop="text">
+            We provide comprehensive {{ business.category | lower }} services to customers in {{ business.city }} and surrounding areas.
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</article>
+
+<!-- Schema.org Business Hours (template) -->
+<script type="application/ld+json" style="display: none;">
+{
+  "@context": "https://schema.org",
+  "@type": "OpeningHoursSpecification",
+  "dayOfWeek": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+  "opens": "09:00",
+  "closes": "17:00"
+}
+</script>
+{% endblock %}
+
+{% block sidebar %}
+<aside class="business-sidebar">
+  <div class="sidebar-widget">
+    <h3>Quick Info</h3>
+    <ul class="quick-info-list">
+      <li><strong>Category:</strong> {{ business.category }}</li>
+      <li><strong>City:</strong> {{ business.city }}, {{ business.state }}</li>
+      {% if business.rating %}
+      <li><strong>Rating:</strong> {{ business.rating }}/5.0</li>
+      {% endif %}
+    </ul>
+  </div>
+
+  <div class="sidebar-widget">
+    <h3>Share This Business</h3>
+    <div class="share-buttons">
+      <a href="https://www.facebook.com/sharer/sharer.php?u={{ request.url | urlencode }}"
+         target="_blank" class="share-button facebook">Facebook</a>
+      <a href="https://twitter.com/intent/tweet?url={{ request.url | urlencode }}&text={{ seo.title | urlencode }}"
+         target="_blank" class="share-button twitter">Twitter</a>
+      <a href="https://www.linkedin.com/sharing/share-offsite/?url={{ request.url | urlencode }}"
+         target="_blank" class="share-button linkedin">LinkedIn</a>
+    </div>
+  </div>
+</aside>
+{% endblock %}
+
+{% block extra_javascript %}
+<script>
+  // Business-specific tracking
+  document.addEventListener('DOMContentLoaded', function() {
+    // Track contact interactions
+    document.querySelectorAll('.phone-link, .email-link, .website-link').forEach(link => {
+      link.addEventListener('click', function() {
+        if (window.gtag) {
+          gtag('event', 'contact_interaction', {
+            business_id: '{{ business.business_id }}',
+            business_name: '{{ business.name }}',
+            contact_type: this.className.includes('phone') ? 'phone' :
+                         this.className.includes('email') ? 'email' : 'website'
+          });
+        }
+      });
+    });
+
+    // Track CTA button clicks
+    document.querySelectorAll('.cta-button').forEach(button => {
+      button.addEventListener('click', function() {
+        if (window.gtag) {
+          gtag('event', 'cta_click', {
+            business_id: '{{ business.business_id }}',
+            business_name: '{{ business.name }}',
+            cta_type: this.textContent.trim()
+          });
+        }
+      });
+    });
+
+    // Track internal link clicks
+    document.querySelectorAll('.related-link').forEach(link => {
+      link.addEventListener('click', function() {
+        if (window.gtag) {
+          gtag('event', 'internal_link_click', {
+            business_id: '{{ business.business_id }}',
+            target_url: this.href
+          });
+        }
+      });
+    });
+  });
+</script>
+{% endblock %}

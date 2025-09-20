@@ -1,0 +1,101 @@
+<svg width="1500" height="900" viewBox="0 0 1500 900" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .lane { fill:#fbfbfb; stroke:#cfcfcf; stroke-width:1; }
+      .actor{ font:700 14px system-ui,Segoe UI,Roboto,Helvetica,Arial; fill:#111; }
+      .note { fill:#fffbe6; stroke:#c9b24c; stroke-width:1; rx:8; ry:8; }
+      .evt  { fill:#ffffff; stroke:#222; stroke-width:1.4; rx:10; ry:10; }
+      .cap  { font: 13px system-ui,Segoe UI,Roboto,Helvetica,Arial; fill:#222; }
+      .sub  { font: 12px system-ui,Segoe UI,Roboto,Helvetica,Arial; fill:#555; }
+      .arr  { stroke:#333; stroke-width:2; marker-end:url(#a); fill:none; }
+    </style>
+    <marker id="a" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#333"/>
+    </marker>
+  </defs>
+
+  <!-- SWIMLANES (wide spacing to avoid overlap) -->
+  <rect class="lane" x="40"  y="40" width="220" height="820"/>
+  <text class="actor" x="150" y="70" text-anchor="middle">Data Source</text>
+  <text class="sub"   x="150" y="90" text-anchor="middle">CSV / API</text>
+
+  <rect class="lane" x="280" y="40" width="250" height="820"/>
+  <text class="actor" x="405" y="70" text-anchor="middle">S3 + Glue + Athena</text>
+
+  <rect class="lane" x="550" y="40" width="400" height="820"/>
+  <text class="actor" x="750" y="70" text-anchor="middle">Step Functions + Lambdas</text>
+
+  <rect class="lane" x="970" y="40" width="220" height="820"/>
+  <text class="actor" x="1080" y="70" text-anchor="middle">Bedrock (Claude)</text>
+
+  <rect class="lane" x="1210" y="40" width="250" height="820"/>
+  <text class="actor" x="1335" y="70" text-anchor="middle">Static Site</text>
+  <text class="sub"   x="1335" y="90" text-anchor="middle">S3 / CloudFront</text>
+
+  <!-- 1. Upload -->
+  <rect class="evt" x="70" y="120" width="180" height="56"/>
+  <text class="cap" x="160" y="153" text-anchor="middle">Upload CSV / Fetch API</text>
+  <line class="arr" x1="250" y1="148" x2="280" y2="148"/>
+
+  <!-- raw landing -->
+  <rect class="evt" x="300" y="120" width="210" height="56"/>
+  <text class="cap" x="405" y="153" text-anchor="middle">S3 raw/ (landing)</text>
+  <line class="arr" x1="510" y1="148" x2="550" y2="148"/>
+
+  <!-- 2. Ingest -->
+  <rect class="evt" x="580" y="120" width="280" height="56"/>
+  <text class="cap" x="720" y="153" text-anchor="middle">Lambda: ingest_raw → manifest + run_id</text>
+
+  <!-- 3. Clean -->
+  <rect class="evt" x="580" y="210" width="280" height="56"/>
+  <text class="cap" x="720" y="243" text-anchor="middle">Lambda: clean_transform → curated</text>
+  <line class="arr" x1="720" y1="266" x2="720" y2="300"/>
+
+  <!-- curated artefacts -->
+  <rect class="evt" x="300" y="290" width="210" height="56"/>
+  <text class="cap" x="405" y="323" text-anchor="middle">S3 curated/ datasets</text>
+  <line class="arr" x1="405" y1="346" x2="405" y2="380"/>
+
+  <!-- Glue -->
+  <rect class="evt" x="300" y="380" width="210" height="56"/>
+  <text class="cap" x="405" y="413" text-anchor="middle">Glue Crawler / Catalog</text>
+  <line class="arr" x1="405" y1="436" x2="405" y2="470"/>
+
+  <!-- Athena -->
+  <rect class="evt" x="300" y="470" width="210" height="56"/>
+  <text class="cap" x="405" y="503" text-anchor="middle">Athena: profiling / publish_list</text>
+  <line class="arr" x1="550" y1="498" x2="580" y2="498"/>
+
+  <!-- 4. Generate -->
+  <rect class="evt" x="580" y="460" width="280" height="56"/>
+  <text class="cap" x="720" y="493" text-anchor="middle">Lambda: agent_generate</text>
+  <line class="arr" x1="860" y1="488" x2="970" y2="488"/>
+  <rect class="evt" x="990" y="460" width="180" height="56"/>
+  <text class="cap" x="1080" y="493" text-anchor="middle">Bedrock: Claude</text>
+  <rect class="note" x="990" y="520" width="180" height="44"/>
+  <text class="sub" x="1080" y="547" text-anchor="middle">Returns PageSpec JSON</text>
+  <line class="arr" x1="1170" y1="488" x2="1210" y2="488"/>
+
+  <!-- 5. QC -->
+  <rect class="evt" x="580" y="550" width="280" height="56"/>
+  <text class="cap" x="720" y="583" text-anchor="middle">Lambda: agent_qc (rules + repair)</text>
+  <rect class="note" x="590" y="610" width="300" height="44"/>
+  <text class="sub" x="740" y="637" text-anchor="middle">meta ≤160 • H1 ≤70 • internal links 3–5</text>
+  <line class="arr" x1="720" y1="654" x2="720" y2="688"/>
+
+  <!-- final spec -->
+  <rect class="evt" x="580" y="690" width="280" height="56"/>
+  <text class="cap" x="720" y="723" text-anchor="middle">Final PageSpec + trace.json</text>
+  <line class="arr" x1="860" y1="718" x2="1210" y2="718"/>
+
+  <!-- 6. Render -->
+  <rect class="evt" x="1230" y="680" width="210" height="56"/>
+  <text class="cap" x="1335" y="713" text-anchor="middle">Lambda: render_html (Jinja2)</text>
+  <rect class="note" x="1230" y="740" width="210" height="44"/>
+  <text class="sub" x="1335" y="767" text-anchor="middle">JSON-LD • sitemap.xml • robots.txt</text>
+  <line class="arr" x1="1335" y1="784" x2="1335" y2="828"/>
+
+  <!-- 7. Publish -->
+  <rect class="evt" x="1230" y="828" width="210" height="56"/>
+  <text class="cap" x="1335" y="861" text-anchor="middle">Lambda: publish_site → S3 Website</text>
+</svg>

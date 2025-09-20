@@ -1,0 +1,107 @@
+<svg width="1400" height="560" viewBox="0 0 1400 560" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .box { fill:#ffffff; stroke:#222; stroke-width:1.6; rx:12; ry:12; }
+      .cyl { fill:#e8f3ff; stroke:#1f4e79; stroke-width:1.6; rx:12; ry:12; }
+      .svc { fill:#f7f7f7; stroke:#444; stroke-width:1.6; rx:12; ry:12; }
+      .hi  { fill:#e9fbe9; stroke:#2c6b2f; stroke-width:1.6; rx:12; ry:12; }
+      .pink{ fill:#fde7ef; stroke:#7b294b; stroke-width:1.6; rx:12; ry:12; }
+      .L   { font:600 16px system-ui,Segoe UI,Roboto,Helvetica,Arial; fill:#111; }
+      .S   { font:12px system-ui,Segoe UI,Roboto,Helvetica,Arial; fill:#333; }
+      .arrow { stroke:#333; stroke-width:1.8; marker-end:url(#arr); fill:none; }
+      .side  { stroke:#666; stroke-width:1.4; marker-end:url(#arrSm); fill:none; stroke-dasharray:5 4; }
+    </style>
+    <marker id="arr" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#333"/>
+    </marker>
+    <marker id="arrSm" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <!-- LANE TITLES -->
+  <text class="L" x="110" y="40" text-anchor="middle">Input</text>
+  <text class="L" x="380" y="40" text-anchor="middle">Landing</text>
+  <text class="L" x="695" y="40" text-anchor="middle">Transform</text>
+  <text class="L" x="1010" y="40" text-anchor="middle">Model &amp; Site</text>
+  <text class="L" x="1260" y="40" text-anchor="middle">Delivery</text>
+
+  <!-- ROW 1 (TOP FLOW) -->
+  <rect class="box" x="40"  y="90" width="140" height="66"/>
+  <text class="L" x="110" y="116" text-anchor="middle">CSV / API</text>
+  <text class="S" x="110" y="136" text-anchor="middle">Input Data</text>
+
+  <rect class="cyl" x="310" y="90" width="140" height="66"/>
+  <text class="L" x="380" y="116" text-anchor="middle">S3 (raw/)</text>
+
+  <rect class="svc" x="580" y="90" width="230" height="66"/>
+  <text class="L" x="695" y="116" text-anchor="middle">Lambda: clean_transform</text>
+  <text class="S" x="695" y="136" text-anchor="middle">lambdas/clean_transform/app.py</text>
+
+  <rect class="cyl" x="930" y="90" width="160" height="66"/>
+  <text class="L" x="1010" y="116" text-anchor="middle">S3 (curated/)</text>
+
+  <rect class="pink" x="1180" y="90" width="180" height="66"/>
+  <text class="L" x="1270" y="116" text-anchor="middle">Static Website</text>
+  <text class="S" x="1270" y="136" text-anchor="middle">S3 Website / CloudFront</text>
+
+  <!-- ROW 2 (MIDDLE: MODEL & RENDER) -->
+  <rect class="svc" x="520" y="220" width="200" height="66"/>
+  <text class="L" x="620" y="246" text-anchor="middle">Lambda: agent_generate</text>
+  <text class="S" x="620" y="266" text-anchor="middle">(Bedrock) • lambdas/agent_generate</text>
+
+  <rect class="svc" x="750" y="220" width="200" height="66"/>
+  <text class="L" x="850" y="246" text-anchor="middle">Lambda: agent_qc</text>
+  <text class="S" x="850" y="266" text-anchor="middle">lambdas/agent_qc</text>
+
+  <rect class="svc" x="980" y="220" width="200" height="66"/>
+  <text class="L" x="1080" y="246" text-anchor="middle">Lambda: render_html</text>
+  <text class="S" x="1080" y="266" text-anchor="middle">Jinja2 • site_templates/</text>
+
+  <rect class="cyl" x="1210" y="220" width="160" height="66"/>
+  <text class="L" x="1290" y="246" text-anchor="middle">S3 (site/)</text>
+
+  <!-- ROW 3 (AUX: INGEST + CATALOG/SQL + PUBLISH) -->
+  <rect class="svc" x="300" y="350" width="200" height="66"/>
+  <text class="L" x="400" y="376" text-anchor="middle">Lambda: ingest_raw</text>
+  <text class="S" x="400" y="396" text-anchor="middle">lambdas/ingest_raw/app.py</text>
+
+  <rect class="box" x="540" y="350" width="210" height="66"/>
+  <text class="L" x="645" y="376" text-anchor="middle">Glue Crawler + Catalog</text>
+  <text class="S" x="645" y="396" text-anchor="middle">schema over curated/</text>
+
+  <rect class="box" x="780" y="350" width="210" height="66"/>
+  <text class="L" x="885" y="376" text-anchor="middle">Athena SQL</text>
+  <text class="S" x="885" y="396" text-anchor="middle">profiling.sql • publish_list.sql</text>
+
+  <rect class="svc" x="1020" y="350" width="210" height="66"/>
+  <text class="L" x="1125" y="376" text-anchor="middle">Lambda: publish_site</text>
+  <text class="S" x="1125" y="396" text-anchor="middle">lambdas/publish_site/app.py</text>
+
+  <!-- ORCHESTRATOR -->
+  <rect class="hi" x="320" y="460" width="760" height="66"/>
+  <text class="L" x="700" y="486" text-anchor="middle">AWS Step Functions: Orchestrator</text>
+  <text class="S" x="700" y="506" text-anchor="middle">Ingest → Clean → Generate → QC → Render → Publish</text>
+
+  <!-- ARROWS (TOP MAIN) -->
+  <path class="arrow" d="M180,123 L310,123"/>
+  <path class="arrow" d="M450,383 L540,383"/>    <!-- ingest_raw -> Glue -->
+  <path class="arrow" d="M310,123 C310,123 550,123 580,123"/>  <!-- raw -> clean -->
+
+  <path class="arrow" d="M810,123 L930,123"/>    <!-- clean -> curated -->
+  <path class="side"  d="M1010,156 L1010,350"/>  <!-- curated -> Glue -->
+
+  <!-- MODEL/RUN FLOW -->
+  <path class="side"  d="M1010,156 C1010,190 620,190 620,220"/> <!-- curated -> agent_generate -->
+  <path class="arrow" d="M720,253 L750,253"/>  <!-- gen -> qc -->
+  <path class="arrow" d="M950,253 L980,253"/>  <!-- qc -> render -->
+  <path class="arrow" d="M1180,253 L1210,253"/> <!-- render -> site/ -->
+
+  <!-- SQL side -->
+  <path class="side"  d="M645,416 L645,460"/>   <!-- Glue -> Orchestrator -->
+  <path class="side"  d="M885,416 L885,460"/>   <!-- Athena -> Orchestrator -->
+
+  <!-- PUBLISH & WEBSITE -->
+  <path class="arrow" d="M1170,383 L1230,383"/>
+  <path class="side"  d="M1290,286 L1270,156"/> <!-- site/ -> Static Website (top) -->
+</svg>

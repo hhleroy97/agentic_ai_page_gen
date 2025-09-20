@@ -1,0 +1,165 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.12]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt', '**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Cache Node dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-mock moto black isort flake8 mypy bandit
+
+    - name: Install Node dependencies
+      run: |
+        npm ci
+
+    - name: Run Python linting
+      run: |
+        # Check code formatting
+        black --check lambdas/
+        # Check import sorting
+        isort --check-only lambdas/
+        # Run flake8
+        flake8 lambdas/
+        # Type checking
+        mypy lambdas/common/ --ignore-missing-imports
+
+    - name: Run security checks
+      run: |
+        bandit -r lambdas/ -ll
+
+    - name: Run Python tests
+      run: |
+        python -m pytest tests/ -v --cov=lambdas --cov-report=xml --cov-report=term-missing
+
+    - name: Run frontend linting
+      run: |
+        npm run lint:all
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+    - name: Validate CloudFormation template
+      run: |
+        pip install cfn-lint
+        cfn-lint template.yaml
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.12
+
+    - name: Set up SAM CLI
+      uses: aws-actions/setup-sam@v2
+
+    - name: Build SAM application
+      run: |
+        sam build --use-container
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: sam-build
+        path: .aws-sam/build/
+
+  security-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  docs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.12
+
+    - name: Install documentation dependencies
+      run: |
+        pip install jupyter nbconvert matplotlib pandas seaborn
+
+    - name: Execute Jupyter notebook
+      run: |
+        cd notebooks
+        jupyter nbconvert --to notebook --execute eda.ipynb --inplace
+
+    - name: Convert notebook to HTML
+      run: |
+        cd notebooks
+        jupyter nbconvert --to html eda.ipynb
+
+    - name: Upload documentation
+      uses: actions/upload-artifact@v3
+      with:
+        name: documentation
+        path: notebooks/eda.html

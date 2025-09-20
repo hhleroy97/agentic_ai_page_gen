@@ -68,8 +68,36 @@ demo:
 	@echo "Pipeline execution started. Monitor at: https://console.aws.amazon.com/states/"
 
 test:
-	@echo "Running unit tests..."
-	python -m pytest tests/ -v || echo "No tests found yet"
+	@echo "Running comprehensive test suite..."
+	./scripts/run-tests.sh
+
+test-python:
+	@echo "Running Python unit tests only..."
+	python -m pytest tests/ -v --cov=lambdas --cov-report=term-missing
+
+test-frontend:
+	@echo "Running frontend linting and validation..."
+	npm run lint:all
+
+test-fast:
+	@echo "Running fast tests only..."
+	python -m pytest tests/ -v -m "not slow"
+
+format:
+	@echo "Formatting code..."
+	black lambdas/
+	isort lambdas/
+	npm run format
+
+lint:
+	@echo "Running linters..."
+	flake8 lambdas/
+	mypy lambdas/common/ --ignore-missing-imports
+	npm run lint:all
+
+security:
+	@echo "Running security checks..."
+	bandit -r lambdas/ -f json -o reports/bandit-security.json
 
 # Upload sample data
 upload-sample:

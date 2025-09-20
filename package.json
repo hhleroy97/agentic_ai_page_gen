@@ -1,0 +1,56 @@
+{
+  "name": "agentic-seo-content-factory",
+  "version": "1.0.0",
+  "description": "Frontend linting and testing tools for Agentic Local SEO Content Factory",
+  "scripts": {
+    "lint:html": "htmlhint site_templates/**/*.html",
+    "lint:css": "stylelint site_templates/**/*.css",
+    "lint:js": "eslint site_templates/**/*.js",
+    "lint:all": "npm run lint:html && npm run lint:css && npm run lint:js",
+    "format": "prettier --write site_templates/**/*.{html,css,js}",
+    "test:a11y": "pa11y-ci --sitemap http://localhost:3000/sitemap.xml",
+    "test:lighthouse": "lighthouse --output html --output-path ./reports/lighthouse.html",
+    "test:web-vitals": "node scripts/web-vitals-test.js",
+    "validate:html": "html-validate site_templates/**/*.html",
+    "audit:performance": "npm run test:lighthouse && npm run test:web-vitals",
+    "audit:accessibility": "npm run test:a11y",
+    "precommit": "npm run lint:all && npm run format",
+    "test:all": "npm run lint:all && npm run audit:accessibility"
+  },
+  "devDependencies": {
+    "htmlhint": "^1.1.4",
+    "stylelint": "^15.10.0",
+    "stylelint-config-standard": "^34.0.0",
+    "stylelint-config-prettier": "^10.0.0",
+    "eslint": "^8.45.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.27.5",
+    "eslint-plugin-n": "^16.0.1",
+    "eslint-plugin-promise": "^6.1.1",
+    "prettier": "^3.0.0",
+    "pa11y-ci": "^3.0.1",
+    "axe-core": "^4.7.2",
+    "lighthouse": "^10.4.0",
+    "web-vitals": "^3.3.2",
+    "html-validate": "^8.2.0",
+    "markdownlint-cli": "^0.35.0"
+  },
+  "keywords": [
+    "seo",
+    "content-generation",
+    "aws",
+    "serverless",
+    "ai",
+    "local-business"
+  ],
+  "author": "Agentic SEO Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hhleroy97/agentic_ai_page_gen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hhleroy97/agentic_ai_page_gen/issues"
+  },
+  "homepage": "https://github.com/hhleroy97/agentic_ai_page_gen#readme"
+}

@@ -75,21 +75,21 @@ class BedrockClient:
         self.models = {
             'claude-3-5-sonnet': {
                 'model_id': 'us.anthropic.claude-3-5-sonnet-20241022-v2:0',
-                'max_tokens': 8192,
-                'temperature': 0.1,
+                'max_tokens': 4096,
+                'temperature': 0.3,
                 'top_p': 0.9,
                 'fallback_order': 1
             },
             'claude-3-sonnet': {
                 'model_id': 'anthropic.claude-3-sonnet-20240229-v1:0',
-                'max_tokens': 8192,
-                'temperature': 0.1,
+                'max_tokens': 4096,
+                'temperature': 0.3,
                 'top_p': 0.9,
                 'fallback_order': 2
             },
             'claude-3-haiku': {
                 'model_id': 'anthropic.claude-3-haiku-20240307-v1:0',
-                'max_tokens': 8192,
+                'max_tokens': 4096,
                 'temperature': 0.1,
                 'top_p': 0.9,
                 'fallback_order': 3
@@ -97,7 +97,7 @@ class BedrockClient:
             'claude-instant': {
                 'model_id': 'anthropic.claude-instant-v1',
                 'max_tokens': 4096,
-                'temperature': 0.1,
+                'temperature': 0.2,
                 'top_p': 0.9,
                 'fallback_order': 4
             }
@@ -301,10 +301,6 @@ class BedrockClient:
         You must respond with valid JSON that matches the specified schema exactly.
         Do not include any text outside the JSON response."""
 
-        # Log prompt length for debugging
-        logger.info(f"Generating content for {business_id}. Prompt length: {len(prompt)} chars")
-        logger.info(f"System prompt length: {len(system_prompt) if system_prompt else 0} chars")
-
         # Invoke model with fallback
         response_text, trace = self.invoke_model_with_fallback(prompt, system_prompt, model_name)
         trace.business_id = business_id
@@ -321,18 +317,8 @@ class BedrockClient:
             if cleaned_response.endswith('```'):
                 cleaned_response = cleaned_response[:-3]
 
-            cleaned_response = cleaned_response.strip()
-
-            # Simple approach: just try to parse directly first
-            logger.info(f"Raw response length for {business_id}: {len(response_text)}")
-            logger.info(f"First 300 chars of raw response: {response_text[:300]}")
-
-            # Check if response appears to be truncated (doesn't end with } or ])
-            if not (cleaned_response.endswith('}') or cleaned_response.endswith(']')):
-                error_msg = f"Response appears truncated for {business_id} - doesn't end with }} or ]"
-                logger.error(error_msg)
-                trace.errors.append(error_msg)
-                return None, trace
+            # Clean JSON string to remove invalid control characters
+            cleaned_response = clean_json_string(cleaned_response.strip())
 
             parsed_response = json.loads(cleaned_response)
             trace.quality_checks.append("JSON parsing successful")
@@ -344,8 +330,6 @@ class BedrockClient:
             error_msg = f"Failed to parse JSON response: {str(e)}"
             trace.errors.append(error_msg)
             logger.error(error_msg)
-            logger.error(f"Raw response for {business_id}: {response_text[:500]}")
-            logger.error(f"Cleaned response for {business_id}: {cleaned_response[:500]}")
             return None, trace
 
     def quality_check_content(self, content_data: Dict[str, Any], business_id: str = 'unknown',

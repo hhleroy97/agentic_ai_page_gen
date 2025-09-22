@@ -1,6 +1,6 @@
 """
-HTML rendering Lambda function.
-Converts PageSpec objects to static HTML files using Jinja2 templates.
+HTML Rendering Lambda function.
+Converts PageSpec JSON into fully-rendered HTML pages using templates.
 """
 
 import json
@@ -8,20 +8,27 @@ import os
 import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader, Template
-import xml.etree.ElementTree as ET
+import boto3
+from botocore.exceptions import ClientError
+from jinja2 import Environment, BaseLoader, select_autoescape
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Add common modules to path
-import sys
-sys.path.append('/opt/python')
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'common'))
-
-from schemas import PageSpec, Business
+from schemas import Business, PageSpec, PipelineStatus
 from s3_utils import S3Manager
+
+
+class StringTemplateLoader(BaseLoader):
+    """Jinja2 loader for string templates"""
+
+    def __init__(self, template_string: str):
+        self.template_string = template_string
+
+    def get_source(self, environment, template):
+        return self.template_string, None, lambda: True
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -29,123 +36,211 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Lambda handler for HTML rendering.
 
     Args:
-        event: Lambda event containing processed businesses
+        event: Lambda event (Step Functions input)
         context: Lambda context
 
     Returns:
         Dictionary with rendering results
     """
-    logger.info(f"Starting HTML rendering")
+    logger.info(f"Starting HTML rendering with event: {json.dumps(event, default=str)}")
 
     try:
-        # Initialize services
+        # Initialize S3 manager
         s3_manager = S3Manager(region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
-        # Get environment variables
+        # Get bucket names from environment
         processed_bucket = os.environ['PROCESSED_BUCKET']
         website_bucket = os.environ['WEBSITE_BUCKET']
 
-        # Extract data from previous steps
-        processed_businesses = event.get('processed_businesses', [])
+        # Extract parameters from event
         execution_id = event.get('execution_id', context.aws_request_id)
+        input_file = event.get('output_file')  # From agent_qc step
 
-        if not processed_businesses:
-            raise ValueError("No processed businesses found in event")
+        if not input_file:
+            raise Exception("No input file specified from previous step")
 
-        logger.info(f"Rendering HTML for {len(processed_businesses)} businesses")
+        # Initialize pipeline status
+        pipeline_status = PipelineStatus(
+            execution_id=execution_id,
+            stage='render_html',
+            total_businesses=0
+        )
 
-        # Load site templates
-        template_env = setup_jinja_environment()
+        # Download QC results data
+        logger.info(f"Downloading QC results: s3://{processed_bucket}/{input_file}")
+        qc_data = s3_manager.download_json(processed_bucket, input_file)
 
-        # Process each business and render HTML
+        if not qc_data:
+            error_msg = f"Failed to download QC results from {input_file}"
+            logger.error(error_msg)
+            pipeline_status.errors.append(error_msg)
+            pipeline_status.stage = 'failed'
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            raise Exception(error_msg)
+
+        generated_pages = qc_data.get('generated_pages', [])
+        qc_results = qc_data.get('qc_results', [])
+        pipeline_status.total_businesses = len(generated_pages)
+
+        logger.info(f"Rendering {len(generated_pages)} pages to HTML")
+
+        # Create mapping of business_id to QC results
+        qc_lookup = {result['business_id']: result for result in qc_results}
+
+        # Load HTML template
+        template_html = get_page_template()
+        jinja_env = Environment(
+            loader=StringTemplateLoader(template_html),
+            autoescape=select_autoescape(['html', 'xml'])
+        )
+        template = jinja_env.get_template('')
+
+        # Render each page
         rendered_pages = []
-        rendering_errors = []
+        successful_renders = 0
+        failed_renders = 0
 
-        for business_result in processed_businesses:
+        for idx, page_data in enumerate(generated_pages):
             try:
-                # Extract PageSpec from business result
-                page_spec_data = business_result.get('qc_result', {}).get('Payload', {}).get('page_spec')
-                if not page_spec_data:
-                    # Try alternative path
-                    page_spec_data = business_result.get('generate_result', {}).get('Payload', {}).get('page_spec')
+                business_id = page_data['business_id']
+                generation_successful = page_data.get('generation_successful', False)
 
-                if not page_spec_data:
-                    logger.warning(f"No page spec found for business result")
+                if not generation_successful:
+                    logger.info(f"Skipping render for {business_id} - generation failed")
+                    rendered_pages.append({
+                        'business_id': business_id,
+                        'render_successful': False,
+                        'reason': 'generation_failed',
+                        'html_file': None
+                    })
+                    failed_renders += 1
                     continue
 
-                page_spec = PageSpec(**page_spec_data)
+                page_spec_dict = page_data.get('page_spec')
+                if not page_spec_dict:
+                    error_msg = f"No page spec found for {business_id}"
+                    logger.error(error_msg)
+                    rendered_pages.append({
+                        'business_id': business_id,
+                        'render_successful': False,
+                        'reason': 'no_page_spec',
+                        'html_file': None
+                    })
+                    failed_renders += 1
+                    continue
 
-                # Render HTML page
-                html_content = render_business_page(template_env, page_spec)
+                # Create PageSpec object
+                page_spec = PageSpec(**page_spec_dict)
+                logger.info(f"Rendering HTML for: {page_spec.business.name}")
 
-                if html_content:
-                    # Save HTML to website bucket
-                    html_key = f"pages/{page_spec.seo.slug}.html"
-                    if s3_manager.upload_text(website_bucket, html_key, html_content, 'text/html'):
-                        rendered_pages.append({
-                            'business_id': page_spec.business.business_id,
-                            'business_name': page_spec.business.name,
-                            'slug': page_spec.seo.slug,
-                            'html_key': html_key,
-                            'quality_score': page_spec.quality_score
-                        })
-                        logger.info(f"Rendered page for {page_spec.business.name}")
-                    else:
-                        raise Exception(f"Failed to upload HTML for {page_spec.business.name}")
+                # Get QC information
+                qc_info = qc_lookup.get(business_id, {})
+                quality_score = None
+                if qc_info.get('quality_feedback'):
+                    quality_score = qc_info['quality_feedback'].get('quality_score', 0.0)
+
+                # Render HTML
+                html_content = render_page_html(template, page_spec, quality_score)
+
+                # Save HTML to website bucket
+                html_filename = f"{page_spec.seo.slug}.html"
+                html_key = f"pages/{html_filename}"
+
+                if s3_manager.upload_text(website_bucket, html_key, html_content):
+                    rendered_pages.append({
+                        'business_id': business_id,
+                        'render_successful': True,
+                        'html_file': html_key,
+                        'slug': page_spec.seo.slug,
+                        'title': page_spec.seo.title,
+                        'quality_score': quality_score
+                    })
+                    successful_renders += 1
+                    logger.info(f"Successfully rendered: {page_spec.business.name} -> {html_filename}")
+                else:
+                    error_msg = f"Failed to upload HTML for {business_id}"
+                    logger.error(error_msg)
+                    rendered_pages.append({
+                        'business_id': business_id,
+                        'render_successful': False,
+                        'reason': 'upload_failed',
+                        'html_file': None
+                    })
+                    failed_renders += 1
 
             except Exception as e:
-                error_msg = f"Failed to render business page: {str(e)}"
-                rendering_errors.append(error_msg)
-                logger.warning(error_msg)
+                error_msg = f"Error rendering page {idx + 1}: {str(e)}"
+                logger.error(error_msg)
+                pipeline_status.errors.append(error_msg)
+                failed_renders += 1
 
-        # Generate and upload sitemap
-        try:
-            sitemap_content = generate_sitemap(rendered_pages, website_bucket)
-            s3_manager.upload_text(website_bucket, 'sitemap.xml', sitemap_content, 'application/xml')
-            logger.info("Generated and uploaded sitemap.xml")
-        except Exception as e:
-            logger.warning(f"Failed to generate sitemap: {str(e)}")
+        # Update pipeline status
+        pipeline_status.processed_businesses = successful_renders
 
-        # Generate and upload robots.txt
-        try:
-            robots_content = generate_robots_txt(website_bucket)
-            s3_manager.upload_text(website_bucket, 'robots.txt', robots_content, 'text/plain')
-            logger.info("Generated and uploaded robots.txt")
-        except Exception as e:
-            logger.warning(f"Failed to generate robots.txt: {str(e)}")
+        # Generate sitemap
+        sitemap_content = generate_sitemap(rendered_pages)
+        s3_manager.upload_text(website_bucket, "sitemap.xml", sitemap_content)
 
-        # Generate index page listing all businesses
-        try:
-            index_content = generate_index_page(template_env, rendered_pages)
-            s3_manager.upload_text(website_bucket, 'index.html', index_content, 'text/html')
-            logger.info("Generated and uploaded index.html")
-        except Exception as e:
-            logger.warning(f"Failed to generate index page: {str(e)}")
+        # Generate robots.txt
+        robots_content = generate_robots_txt()
+        s3_manager.upload_text(website_bucket, "robots.txt", robots_content)
 
-        # Copy CSS and other static assets
+        # Generate index page
+        index_content = generate_index_page(rendered_pages, template)
+        s3_manager.upload_text(website_bucket, "index.html", index_content)
+
+        # Save rendering results
+        output_key = f"content/rendered_{execution_id}.json"
+        output_data = {
+            'execution_id': execution_id,
+            'source_file': input_file,
+            'total_pages': len(generated_pages),
+            'successful_renders': successful_renders,
+            'failed_renders': failed_renders,
+            'rendered_pages': rendered_pages
+        }
+
+        if not s3_manager.upload_json(processed_bucket, output_key, output_data):
+            error_msg = "Failed to save rendering results"
+            logger.error(error_msg)
+            pipeline_status.errors.append(error_msg)
+            pipeline_status.stage = 'failed'
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            raise Exception(error_msg)
+
+        # Save pipeline status
+        pipeline_status.stage = 'completed'
         try:
-            copy_static_assets(s3_manager, website_bucket)
-            logger.info("Copied static assets")
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            logger.info("Pipeline status saved successfully")
         except Exception as e:
-            logger.warning(f"Failed to copy static assets: {str(e)}")
+            logger.warning(f"Failed to save pipeline status: {str(e)} - continuing anyway")
 
         # Prepare response
         response = {
             'statusCode': 200,
             'execution_id': execution_id,
-            'total_businesses': len(processed_businesses),
-            'rendered_pages': len(rendered_pages),
-            'rendering_errors': len(rendering_errors),
-            'pages': rendered_pages,
-            'errors': rendering_errors[:10]  # Limit error list
+            'total_pages': len(generated_pages),
+            'successful_renders': successful_renders,
+            'failed_renders': failed_renders,
+            'output_file': output_key
         }
 
-        logger.info(f"HTML rendering completed: {len(rendered_pages)} pages rendered")
+        logger.info(f"HTML rendering completed: {successful_renders}/{len(generated_pages)} successful")
         return response
 
     except Exception as e:
         error_msg = f"HTML rendering failed: {str(e)}"
         logger.error(error_msg)
+
+        # Try to update pipeline status
+        try:
+            if 'pipeline_status' in locals():
+                pipeline_status.stage = 'failed'
+                pipeline_status.errors.append(error_msg)
+                s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+        except Exception as status_error:
+            logger.error(f"Failed to save pipeline status: {str(status_error)}")
 
         return {
             'statusCode': 500,
@@ -154,503 +249,349 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
 
-def setup_jinja_environment() -> Environment:
+def get_page_template() -> str:
     """
-    Set up Jinja2 template environment.
+    Return the HTML template for pages.
 
     Returns:
-        Configured Jinja2 Environment
+        HTML template string
     """
-    # In a real deployment, templates would be in /opt/templates or loaded from S3
-    # For this demo, we'll use inline templates
-
-    env = Environment(
-        loader=FileSystemLoader(['/tmp', '.']),  # Fallback paths
-        autoescape=True,
-        trim_blocks=True,
-        lstrip_blocks=True
-    )
-
-    # Add custom filters
-    env.filters['format_phone'] = format_phone_number
-    env.filters['json_ld'] = json_ld_filter
-
-    return env
-
-
-def render_business_page(template_env: Environment, page_spec: PageSpec) -> Optional[str]:
-    """
-    Render HTML page for a business using templates.
-
-    Args:
-        template_env: Jinja2 environment
-        page_spec: Page specification to render
-
-    Returns:
-        Rendered HTML content or None if error
-    """
-    try:
-        # Create template content (in production, this would be loaded from files)
-        template_content = get_business_page_template()
-
-        template = template_env.from_string(template_content)
-
-        # Prepare template context
-        context = {
-            'page': page_spec,
-            'business': page_spec.business,
-            'seo': page_spec.seo,
-            'content': page_spec.content,
-            'jsonld': page_spec.jsonld,
-            'internal_links': page_spec.internal_links,
-            'generated_at': datetime.utcnow(),
-            'site_name': 'Local Business Directory'
-        }
-
-        # Render template
-        rendered_html = template.render(**context)
-
-        return rendered_html
-
-    except Exception as e:
-        logger.error(f"Failed to render business page: {str(e)}")
-        return None
-
-
-def generate_sitemap(pages: List[Dict[str, Any]], website_bucket: str) -> str:
-    """
-    Generate XML sitemap for all rendered pages.
-
-    Args:
-        pages: List of rendered page information
-        website_bucket: Website S3 bucket name
-
-    Returns:
-        XML sitemap content
-    """
-    # Get the website URL (in production, this would be from CloudFront or custom domain)
-    base_url = f"https://{website_bucket}.s3-website-us-east-1.amazonaws.com"
-
-    # Create sitemap XML
-    urlset = ET.Element('urlset')
-    urlset.set('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9')
-
-    # Add index page
-    url_elem = ET.SubElement(urlset, 'url')
-    ET.SubElement(url_elem, 'loc').text = base_url
-    ET.SubElement(url_elem, 'lastmod').text = datetime.utcnow().strftime('%Y-%m-%d')
-    ET.SubElement(url_elem, 'changefreq').text = 'weekly'
-    ET.SubElement(url_elem, 'priority').text = '1.0'
-
-    # Add business pages
-    for page in pages:
-        url_elem = ET.SubElement(urlset, 'url')
-        ET.SubElement(url_elem, 'loc').text = f"{base_url}/pages/{page['slug']}.html"
-        ET.SubElement(url_elem, 'lastmod').text = datetime.utcnow().strftime('%Y-%m-%d')
-        ET.SubElement(url_elem, 'changefreq').text = 'monthly'
-        ET.SubElement(url_elem, 'priority').text = '0.8'
-
-    # Convert to string
-    xml_str = ET.tostring(urlset, encoding='unicode', method='xml')
-    return f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_str}'
-
-
-def generate_robots_txt(website_bucket: str) -> str:
-    """
-    Generate robots.txt file.
-
-    Args:
-        website_bucket: Website S3 bucket name
-
-    Returns:
-        robots.txt content
-    """
-    base_url = f"https://{website_bucket}.s3-website-us-east-1.amazonaws.com"
-
-    return f"""User-agent: *
-Allow: /
-
-Sitemap: {base_url}/sitemap.xml
-
-# Generated by Agentic Local SEO Content Factory
-# {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
-"""
-
-
-def generate_index_page(template_env: Environment, pages: List[Dict[str, Any]]) -> str:
-    """
-    Generate index page listing all businesses.
-
-    Args:
-        template_env: Jinja2 environment
-        pages: List of rendered page information
-
-    Returns:
-        Rendered index page HTML
-    """
-    template_content = get_index_page_template()
-    template = template_env.from_string(template_content)
-
-    # Sort pages by business name
-    sorted_pages = sorted(pages, key=lambda x: x['business_name'])
-
-    context = {
-        'pages': sorted_pages,
-        'total_pages': len(pages),
-        'generated_at': datetime.utcnow(),
-        'site_name': 'Local Business Directory'
-    }
-
-    return template.render(**context)
-
-
-def copy_static_assets(s3_manager: S3Manager, website_bucket: str):
-    """
-    Copy static assets (CSS, JS) to website bucket.
-
-    Args:
-        s3_manager: S3 manager instance
-        website_bucket: Website S3 bucket name
-    """
-    # Create CSS content (in production, this would be copied from files)
-    css_content = get_site_css()
-
-    # Upload CSS
-    s3_manager.upload_text(website_bucket, 'styles.css', css_content, 'text/css')
-
-
-# Template content functions (in production, these would be loaded from files)
-
-def get_business_page_template() -> str:
-    """Get the business page HTML template"""
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ seo.title }}</title>
-    <meta name="description" content="{{ seo.meta_description }}">
-    <meta name="keywords" content="{{ seo.keywords | join(', ') }}">
-    {% if seo.canonical_url %}
-    <link rel="canonical" href="{{ seo.canonical_url }}">
-    {% endif %}
-    <link rel="stylesheet" href="../styles.css">
+    <title>{{ page.seo.title }}</title>
+    <meta name="description" content="{{ page.seo.meta_description }}">
+    <meta name="keywords" content="{{ page.seo.keywords | join(', ') }}">
 
-    <!-- JSON-LD Structured Data -->
+    <!-- Open Graph -->
+    <meta property="og:title" content="{{ page.seo.title }}">
+    <meta property="og:description" content="{{ page.seo.meta_description }}">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://example.com/{{ page.seo.slug }}">
+
+    <!-- Schema.org JSON-LD -->
     <script type="application/ld+json">
-    {{ jsonld | json_ld }}
+    {{ page.schema_org | tojson }}
     </script>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            border-bottom: 3px solid #007cba;
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+        .business-info {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .contact-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin: 15px 0;
+        }
+        .internal-links {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+        .internal-links a {
+            color: #1976d2;
+            text-decoration: none;
+            margin-right: 15px;
+        }
+        .internal-links a:hover {
+            text-decoration: underline;
+        }
+        .footer {
+            border-top: 1px solid #ddd;
+            margin-top: 40px;
+            padding-top: 20px;
+            text-align: center;
+            color: #666;
+        }
+        {% if quality_score %}
+        .quality-badge {
+            background: {% if quality_score >= 0.8 %}#4caf50{% elif quality_score >= 0.6 %}#ff9800{% else %}#f44336{% endif %};
+            color: white;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            float: right;
+        }
+        {% endif %}
+    </style>
 </head>
 <body>
-    <header>
-        <nav>
-            <a href="../index.html">← Back to Directory</a>
-        </nav>
-    </header>
+    <div class="header">
+        <h1>{{ page.seo.h1 }}</h1>
+        {% if quality_score %}
+        <div class="quality-badge">Quality: {{ "%.1f" | format(quality_score * 100) }}%</div>
+        {% endif %}
+    </div>
 
-    <main>
-        <article>
-            <header>
-                <h1>{{ seo.h1 }}</h1>
-                <div class="business-info">
-                    <p><strong>Category:</strong> {{ business.category }}</p>
-                    <p><strong>Location:</strong> {{ business.city }}, {{ business.state }}</p>
-                    {% if business.rating %}
-                    <p><strong>Rating:</strong> {{ business.rating }}/5.0 ({{ business.review_count }} reviews)</p>
-                    {% endif %}
-                </div>
-            </header>
-
-            <section class="introduction">
-                {{ content.introduction }}
-            </section>
-
-            <section class="main-content">
-                {{ content.main_content | replace('\n', '<br>') | safe }}
-            </section>
-
-            {% if content.services_section %}
-            <section class="services">
-                <h2>Our Services</h2>
-                {{ content.services_section | replace('\n', '<br>') | safe }}
-            </section>
+    <div class="business-info">
+        <h2>{{ page.business.name }}</h2>
+        <div class="contact-info">
+            <div><strong>Address:</strong> {{ page.business.address }}, {{ page.business.city }}, {{ page.business.state }} {{ page.business.zip_code }}</div>
+            {% if page.business.phone %}
+            <div><strong>Phone:</strong> <a href="tel:{{ page.business.phone }}">{{ page.business.phone }}</a></div>
             {% endif %}
-
-            {% if content.location_section %}
-            <section class="location">
-                <h2>Location & Service Area</h2>
-                {{ content.location_section | replace('\n', '<br>') | safe }}
-            </section>
+            {% if page.business.website %}
+            <div><strong>Website:</strong> <a href="{{ page.business.website }}" target="_blank">{{ page.business.website }}</a></div>
             {% endif %}
-
-            <section class="contact">
-                <h2>Contact Information</h2>
-                <div class="contact-details">
-                    <p><strong>Address:</strong> {{ business.address }}, {{ business.city }}, {{ business.state }} {{ business.zip_code }}</p>
-                    {% if business.phone %}
-                    <p><strong>Phone:</strong> <a href="tel:{{ business.phone | replace(' ', '') | replace('(', '') | replace(')', '') | replace('-', '') }}">{{ business.phone | format_phone }}</a></p>
-                    {% endif %}
-                    {% if business.website %}
-                    <p><strong>Website:</strong> <a href="{{ business.website }}" target="_blank">{{ business.website }}</a></p>
-                    {% endif %}
-                    {% if business.email %}
-                    <p><strong>Email:</strong> <a href="mailto:{{ business.email }}">{{ business.email }}</a></p>
-                    {% endif %}
-                </div>
-            </section>
-
-            {% if internal_links %}
-            <section class="related-businesses">
-                <h2>Related Local Businesses</h2>
-                <ul>
-                {% for link in internal_links %}
-                    <li><a href="{{ link.url }}">{{ link.anchor_text }}</a></li>
-                {% endfor %}
-                </ul>
-            </section>
+            {% if page.business.email %}
+            <div><strong>Email:</strong> <a href="mailto:{{ page.business.email }}">{{ page.business.email }}</a></div>
             {% endif %}
+        </div>
+        {% if page.business.rating %}
+        <div><strong>Rating:</strong> {{ page.business.rating }}/5.0
+        {% if page.business.review_count %}({{ page.business.review_count }} reviews){% endif %}</div>
+        {% endif %}
+    </div>
 
-            <section class="conclusion">
-                {{ content.conclusion }}
-            </section>
-        </article>
-    </main>
+    {% if page.content.introduction %}
+    <div class="introduction">
+        <p><strong>{{ page.content.introduction }}</strong></p>
+    </div>
+    {% endif %}
 
-    <footer>
-        <p>&copy; {{ generated_at.year }} {{ site_name }}. Generated on {{ generated_at.strftime('%B %d, %Y') }}.</p>
-    </footer>
+    <div class="main-content">
+        {{ page.content.main_content | replace('\n', '</p><p>') | replace('<p></p>', '') | safe }}
+    </div>
+
+    {% if page.content.internal_links %}
+    <div class="internal-links">
+        <h3>Related Local Businesses</h3>
+        {% for link in page.content.internal_links %}
+        <a href="{{ link.url }}">{{ link.text }}</a>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if page.content.conclusion %}
+    <div class="conclusion">
+        <p><em>{{ page.content.conclusion }}</em></p>
+    </div>
+    {% endif %}
+
+    <div class="footer">
+        <p>Generated on {{ current_date.strftime('%B %d, %Y') }}</p>
+        <p>© {{ current_date.year }} Local Business Directory</p>
+    </div>
 </body>
 </html>"""
 
 
-def get_index_page_template() -> str:
-    """Get the index page HTML template"""
-    return """<!DOCTYPE html>
+def render_page_html(template, page_spec: PageSpec, quality_score: Optional[float] = None) -> str:
+    """
+    Render a PageSpec to HTML using the template.
+
+    Args:
+        template: Jinja2 template object
+        page_spec: Page specification to render
+        quality_score: Optional quality score from QC
+
+    Returns:
+        Rendered HTML string
+    """
+    return template.render(
+        page=page_spec,
+        quality_score=quality_score,
+        current_date=datetime.now()
+    )
+
+
+def generate_sitemap(rendered_pages: List[Dict[str, Any]]) -> str:
+    """
+    Generate XML sitemap for rendered pages.
+
+    Args:
+        rendered_pages: List of rendered page information
+
+    Returns:
+        XML sitemap content
+    """
+    sitemap_entries = []
+    base_url = "https://example.com"  # Replace with actual domain
+
+    # Add index page
+    sitemap_entries.append(f"""
+    <url>
+        <loc>{base_url}/</loc>
+        <lastmod>{datetime.now().strftime('%Y-%m-%d')}</lastmod>
+        <priority>1.0</priority>
+    </url>""")
+
+    # Add business pages
+    for page in rendered_pages:
+        if page.get('render_successful') and page.get('slug'):
+            sitemap_entries.append(f"""
+    <url>
+        <loc>{base_url}/{page['slug']}</loc>
+        <lastmod>{datetime.now().strftime('%Y-%m-%d')}</lastmod>
+        <priority>0.8</priority>
+    </url>""")
+
+    sitemap_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+{''.join(sitemap_entries)}
+</urlset>"""
+
+    return sitemap_xml
+
+
+def generate_robots_txt() -> str:
+    """
+    Generate robots.txt file.
+
+    Returns:
+        robots.txt content
+    """
+    return """User-agent: *
+Allow: /
+
+Sitemap: https://example.com/sitemap.xml
+"""
+
+
+def generate_index_page(rendered_pages: List[Dict[str, Any]], template) -> str:
+    """
+    Generate index page listing all businesses.
+
+    Args:
+        rendered_pages: List of rendered page information
+        template: Jinja2 template object
+
+    Returns:
+        HTML content for index page
+    """
+    successful_pages = [p for p in rendered_pages if p.get('render_successful')]
+
+    index_template = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Local Business Directory</title>
-    <meta name="description" content="Discover local businesses in your area. Professional services, restaurants, automotive, and more.">
-    <link rel="stylesheet" href="styles.css">
+    <meta name="description" content="Comprehensive directory of local businesses in your area">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            border-bottom: 3px solid #007cba;
+            padding-bottom: 20px;
+        }
+        .business-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        .business-card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 20px;
+            background: #fff;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: transform 0.2s;
+        }
+        .business-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        }
+        .business-card h3 {
+            margin: 0 0 10px 0;
+            color: #007cba;
+        }
+        .business-card a {
+            text-decoration: none;
+            color: inherit;
+        }
+        .quality-score {
+            float: right;
+            background: #4caf50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.8em;
+        }
+        .stats {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            color: #666;
+        }
+    </style>
 </head>
 <body>
-    <header>
+    <div class="header">
         <h1>Local Business Directory</h1>
-        <p>Discover {{ total_pages }} local businesses in your area</p>
-    </header>
+        <p>Discover amazing local businesses in your community</p>
+    </div>
 
-    <main>
-        <section class="business-grid">
-            {% for page in pages %}
-            <div class="business-card">
-                <h2><a href="pages/{{ page.slug }}.html">{{ page.business_name }}</a></h2>
-                <p class="quality-score">Quality Score: {{ page.quality_score }}/1.0</p>
-                <a href="pages/{{ page.slug }}.html" class="read-more">View Details →</a>
-            </div>
-            {% endfor %}
-        </section>
-    </main>
+    <div class="stats">
+        <h2>{{ successful_pages | length }} Local Businesses</h2>
+        <p>Generated on {{ current_date.strftime('%B %d, %Y') }}</p>
+    </div>
 
-    <footer>
-        <p>&copy; {{ generated_at.year }} {{ site_name }}. Generated on {{ generated_at.strftime('%B %d, %Y') }}.</p>
-        <p>{{ total_pages }} businesses • Powered by Agentic Local SEO Content Factory</p>
-    </footer>
+    <div class="business-grid">
+        {% for page in successful_pages %}
+        <div class="business-card">
+            <a href="{{ page.slug }}.html">
+                <h3>{{ page.title }}
+                {% if page.quality_score %}
+                <span class="quality-score">{{ "%.0f" | format(page.quality_score * 100) }}%</span>
+                {% endif %}
+                </h3>
+            </a>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="footer">
+        <p>© {{ current_date.year }} Local Business Directory</p>
+        <p>Generated by Agentic AI Content Factory</p>
+    </div>
 </body>
 </html>"""
 
+    jinja_env = Environment(
+        loader=StringTemplateLoader(index_template),
+        autoescape=select_autoescape(['html', 'xml'])
+    )
+    index_template_obj = jinja_env.get_template('')
 
-def get_site_css() -> str:
-    """Get the site CSS content"""
-    return """/* Local Business Directory Styles */
-
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
-
-body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    line-height: 1.6;
-    color: #333;
-    background-color: #f8f9fa;
-}
-
-header {
-    background: #fff;
-    padding: 1rem 0;
-    border-bottom: 1px solid #dee2e6;
-    margin-bottom: 2rem;
-}
-
-header h1 {
-    text-align: center;
-    color: #2c3e50;
-    margin-bottom: 0.5rem;
-}
-
-header p {
-    text-align: center;
-    color: #6c757d;
-}
-
-nav a {
-    color: #007bff;
-    text-decoration: none;
-    margin-left: 1rem;
-}
-
-nav a:hover {
-    text-decoration: underline;
-}
-
-main {
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 0 1rem;
-}
-
-article {
-    background: #fff;
-    padding: 2rem;
-    border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    margin-bottom: 2rem;
-}
-
-.business-info {
-    background: #e9ecef;
-    padding: 1rem;
-    border-radius: 4px;
-    margin: 1rem 0;
-}
-
-.business-info p {
-    margin: 0.25rem 0;
-}
-
-section {
-    margin: 2rem 0;
-}
-
-section h2 {
-    color: #2c3e50;
-    margin-bottom: 1rem;
-    border-bottom: 2px solid #007bff;
-    padding-bottom: 0.5rem;
-}
-
-.contact-details {
-    background: #f8f9fa;
-    padding: 1rem;
-    border-radius: 4px;
-    border-left: 4px solid #007bff;
-}
-
-.related-businesses ul {
-    list-style: none;
-    padding: 0;
-}
-
-.related-businesses li {
-    margin: 0.5rem 0;
-}
-
-.related-businesses a {
-    color: #007bff;
-    text-decoration: none;
-    padding: 0.25rem 0;
-    display: inline-block;
-}
-
-.related-businesses a:hover {
-    text-decoration: underline;
-}
-
-/* Index page styles */
-.business-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 1.5rem;
-    margin: 2rem 0;
-}
-
-.business-card {
-    background: #fff;
-    padding: 1.5rem;
-    border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    transition: transform 0.2s ease;
-}
-
-.business-card:hover {
-    transform: translateY(-2px);
-}
-
-.business-card h2 {
-    margin-bottom: 0.5rem;
-}
-
-.business-card h2 a {
-    color: #2c3e50;
-    text-decoration: none;
-}
-
-.business-card h2 a:hover {
-    color: #007bff;
-}
-
-.quality-score {
-    color: #6c757d;
-    font-size: 0.9rem;
-    margin: 0.5rem 0;
-}
-
-.read-more {
-    color: #007bff;
-    text-decoration: none;
-    font-weight: 500;
-}
-
-.read-more:hover {
-    text-decoration: underline;
-}
-
-footer {
-    text-align: center;
-    padding: 2rem 0;
-    margin-top: 3rem;
-    border-top: 1px solid #dee2e6;
-    color: #6c757d;
-    font-size: 0.9rem;
-}
-
-/* Responsive design */
-@media (max-width: 768px) {
-    main {
-        padding: 0 0.5rem;
-    }
-
-    article {
-        padding: 1rem;
-    }
-
-    .business-grid {
-        grid-template-columns: 1fr;
-    }
-}"""
-
-
-# Custom Jinja2 filters
-
-def format_phone_number(phone: str) -> str:
-    """Format phone number for display"""
-    if not phone:
-        return phone
-    return phone  # Already formatted in data processing
-
-
-def json_ld_filter(jsonld_data: Dict[str, Any]) -> str:
-    """Convert JSON-LD data to formatted JSON string"""
-    return json.dumps(jsonld_data, indent=2)
+    return index_template_obj.render(
+        successful_pages=successful_pages,
+        current_date=datetime.now()
+    )

@@ -1,5 +1,7 @@
 # AWS SAM
 .aws-sam/
+sam-installer/
+sam-installation.zip
 samconfig.toml
 
 # Python

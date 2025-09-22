@@ -173,15 +173,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.warning(f"Failed to save pipeline status: {str(e)} - continuing anyway")
             # Don't fail the entire function for status save issues
 
-        # Prepare response - ensure everything is JSON serializable
+        # Prepare response
         response = {
             'statusCode': 200,
             'execution_id': execution_id,
             'total_rows': len(df),
             'valid_businesses': len(businesses),
             'validation_errors': len(validation_errors),
-            'output_file': output_key
-            # Note: Don't include 'businesses' in response to avoid serialization issues
+            'output_file': output_key,
+            'businesses': businesses
         }
 
         logger.info(f"Raw data ingestion completed successfully: {len(businesses)} businesses processed")
@@ -230,16 +230,10 @@ def validate_business_data(business_dict: Dict[str, Any]) -> Business:
     # Clean phone number
     if 'phone' in business_dict and business_dict['phone']:
         phone = str(business_dict['phone']).strip()
-        # Remove all non-digit characters
-        digits_only = ''.join(filter(str.isdigit, phone))
-        
-        # Format as xxx-xxx-xxxx if we have 10 digits
-        if len(digits_only) == 10:
-            phone = f"{digits_only[:3]}-{digits_only[3:6]}-{digits_only[6:]}"
-        elif len(digits_only) == 11 and digits_only[0] == '1':
-            # Handle 11-digit numbers starting with 1 (US country code)
-            phone = f"{digits_only[1:4]}-{digits_only[4:7]}-{digits_only[7:]}"
-        
+        # Remove common formatting
+        phone = phone.replace('(', '').replace(')', '').replace('-', '').replace(' ', '').replace('.', '')
+        if len(phone) == 10:
+            phone = f"({phone[:3]}) {phone[3:6]}-{phone[6:]}"
         business_dict['phone'] = phone if phone else None
 
     # Validate website URL format

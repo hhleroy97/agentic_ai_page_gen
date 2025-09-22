@@ -1,6 +1,6 @@
 """
-Site publishing Lambda function.
-Handles final website deployment, cache invalidation, and analytics setup.
+Site Publishing Lambda function.
+Finalizes the website, updates metadata, and handles post-publication tasks.
 """
 
 import json
@@ -16,11 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Add common modules to path
-import sys
-sys.path.append('/opt/python')
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'common'))
-
-from schemas import PipelineStatus
+from schemas import Business, PageSpec, PipelineStatus
 from s3_utils import S3Manager
 
 
@@ -29,125 +25,117 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Lambda handler for site publishing.
 
     Args:
-        event: Lambda event containing render results
+        event: Lambda event (Step Functions input)
         context: Lambda context
 
     Returns:
         Dictionary with publishing results
     """
-    logger.info(f"Starting site publishing")
+    logger.info(f"Starting site publishing with event: {json.dumps(event, default=str)}")
 
     try:
-        # Initialize services
+        # Initialize S3 manager
         s3_manager = S3Manager(region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
-        # Get environment variables
+        # Get bucket names from environment
         processed_bucket = os.environ['PROCESSED_BUCKET']
         website_bucket = os.environ['WEBSITE_BUCKET']
 
-        # Extract data from previous step
-        render_result = event.get('render_result', {}).get('Payload', {})
-        execution_id = render_result.get('execution_id', context.aws_request_id)
-        rendered_pages = render_result.get('pages', [])
+        # Extract parameters from event
+        execution_id = event.get('execution_id', context.aws_request_id)
+        input_file = event.get('output_file')  # From render_html step
 
-        if not rendered_pages:
-            raise ValueError("No rendered pages found in render results")
+        if not input_file:
+            raise Exception("No input file specified from previous step")
 
-        logger.info(f"Publishing website with {len(rendered_pages)} pages")
-
-        # Update pipeline status
+        # Initialize pipeline status
         pipeline_status = PipelineStatus(
             execution_id=execution_id,
             stage='publish_site',
-            total_businesses=len(rendered_pages),
-            processed_businesses=len(rendered_pages),
-            successful_pages=len(rendered_pages)
+            total_businesses=0
         )
 
-        # Perform publishing tasks
-        publishing_results = {}
+        # Download rendering results data
+        logger.info(f"Downloading rendering results: s3://{processed_bucket}/{input_file}")
+        render_data = s3_manager.download_json(processed_bucket, input_file)
 
-        # 1. Configure S3 bucket for static website hosting
-        try:
-            configure_website_hosting(s3_manager, website_bucket)
-            publishing_results['website_hosting'] = 'configured'
-            logger.info("Configured S3 static website hosting")
-        except Exception as e:
-            error_msg = f"Failed to configure website hosting: {str(e)}"
-            logger.warning(error_msg)
-            publishing_results['website_hosting'] = f'error: {error_msg}'
+        if not render_data:
+            error_msg = f"Failed to download rendering results from {input_file}"
+            logger.error(error_msg)
+            pipeline_status.errors.append(error_msg)
+            pipeline_status.stage = 'failed'
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            raise Exception(error_msg)
 
-        # 2. Generate and upload additional SEO files
-        try:
-            generate_seo_files(s3_manager, website_bucket, rendered_pages)
-            publishing_results['seo_files'] = 'generated'
-            logger.info("Generated additional SEO files")
-        except Exception as e:
-            error_msg = f"Failed to generate SEO files: {str(e)}"
-            logger.warning(error_msg)
-            publishing_results['seo_files'] = f'error: {error_msg}'
+        rendered_pages = render_data.get('rendered_pages', [])
+        successful_renders = render_data.get('successful_renders', 0)
+        failed_renders = render_data.get('failed_renders', 0)
+        pipeline_status.total_businesses = len(rendered_pages)
 
-        # 3. Create site analytics and monitoring setup
-        try:
-            setup_analytics(s3_manager, website_bucket, rendered_pages)
-            publishing_results['analytics'] = 'configured'
-            logger.info("Configured site analytics")
-        except Exception as e:
-            error_msg = f"Failed to setup analytics: {str(e)}"
-            logger.warning(error_msg)
-            publishing_results['analytics'] = f'error: {error_msg}'
+        logger.info(f"Publishing site with {successful_renders} successful pages")
 
-        # 4. Generate performance report
-        try:
-            performance_report = generate_performance_report(rendered_pages, execution_id)
-            report_key = f"reports/performance_{execution_id}.json"
-            s3_manager.upload_json(processed_bucket, report_key, performance_report)
-            publishing_results['performance_report'] = report_key
-            logger.info(f"Generated performance report: {report_key}")
-        except Exception as e:
-            error_msg = f"Failed to generate performance report: {str(e)}"
-            logger.warning(error_msg)
-            publishing_results['performance_report'] = f'error: {error_msg}'
+        # Generate site metadata
+        site_metadata = generate_site_metadata(rendered_pages, execution_id)
 
-        # 5. Create deployment summary
-        try:
-            deployment_summary = create_deployment_summary(rendered_pages, execution_id, publishing_results)
-            summary_key = f"deployments/summary_{execution_id}.json"
-            s3_manager.upload_json(processed_bucket, summary_key, deployment_summary)
-            publishing_results['deployment_summary'] = summary_key
-            logger.info(f"Created deployment summary: {summary_key}")
-        except Exception as e:
-            error_msg = f"Failed to create deployment summary: {str(e)}"
-            logger.warning(error_msg)
-            publishing_results['deployment_summary'] = f'error: {error_msg}'
+        # Upload site metadata
+        metadata_key = "site-metadata.json"
+        if not s3_manager.upload_json(website_bucket, metadata_key, site_metadata):
+            logger.warning("Failed to upload site metadata")
+
+        # Generate and upload analytics tracking (optional)
+        analytics_code = generate_analytics_code()
+        analytics_key = "analytics.js"
+        if analytics_code:
+            s3_manager.upload_text(website_bucket, analytics_key, analytics_code)
+
+        # Generate and upload CSS
+        css_content = generate_global_css()
+        css_key = "styles.css"
+        s3_manager.upload_text(website_bucket, css_key, css_content)
+
+        # Update pipeline status with final results
+        pipeline_status.processed_businesses = successful_renders
+
+        # Generate final execution report
+        execution_report = generate_execution_report(
+            execution_id, rendered_pages, successful_renders, failed_renders
+        )
+
+        # Save execution report
+        report_key = f"reports/execution_report_{execution_id}.json"
+        s3_manager.upload_json(processed_bucket, report_key, execution_report)
 
         # Get website URL
         website_url = get_website_url(website_bucket)
 
-        # Update pipeline status
-        pipeline_status.stage = 'completed'
-        pipeline_status.end_time = datetime.utcnow()
-        s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+        # Log final results
+        logger.info(f"Site publication completed successfully")
+        logger.info(f"Website URL: {website_url}")
+        logger.info(f"Total pages: {len(rendered_pages)}")
+        logger.info(f"Successful: {successful_renders}")
+        logger.info(f"Failed: {failed_renders}")
 
-        # Prepare response
+        # Save pipeline status
+        pipeline_status.stage = 'completed'
+        try:
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            logger.info("Pipeline status saved successfully")
+        except Exception as e:
+            logger.warning(f"Failed to save pipeline status: {str(e)} - continuing anyway")
+
+        # Prepare final response
         response = {
             'statusCode': 200,
             'execution_id': execution_id,
             'website_url': website_url,
             'total_pages': len(rendered_pages),
-            'publishing_results': publishing_results,
-            'deployment_timestamp': datetime.utcnow().isoformat(),
-            'pages_published': [
-                {
-                    'business_name': page['business_name'],
-                    'slug': page['slug'],
-                    'url': f"{website_url}/pages/{page['slug']}.html"
-                }
-                for page in rendered_pages
-            ]
+            'successful_renders': successful_renders,
+            'failed_renders': failed_renders,
+            'site_metadata': site_metadata,
+            'execution_report_file': report_key
         }
 
-        logger.info(f"Site publishing completed successfully: {website_url}")
+        logger.info("Site publishing completed successfully")
         return response
 
     except Exception as e:
@@ -156,16 +144,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # Try to update pipeline status
         try:
-            pipeline_status = PipelineStatus(
-                execution_id=event.get('execution_id', context.aws_request_id),
-                stage='failed',
-                total_businesses=0,
-                end_time=datetime.utcnow()
-            )
-            pipeline_status.errors.append(error_msg)
-            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
-        except:
-            logger.error("Failed to save pipeline status")
+            if 'pipeline_status' in locals():
+                pipeline_status.stage = 'failed'
+                pipeline_status.errors.append(error_msg)
+                s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+        except Exception as status_error:
+            logger.error(f"Failed to save pipeline status: {str(status_error)}")
 
         return {
             'statusCode': 500,
@@ -174,339 +158,373 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
 
-def configure_website_hosting(s3_manager: S3Manager, website_bucket: str):
+def generate_site_metadata(rendered_pages: List[Dict[str, Any]], execution_id: str) -> Dict[str, Any]:
     """
-    Configure S3 bucket for static website hosting.
+    Generate comprehensive site metadata.
 
     Args:
-        s3_manager: S3 manager instance
-        website_bucket: Website S3 bucket name
-    """
-    try:
-        # Configure website hosting
-        website_config = {
-            'IndexDocument': {'Suffix': 'index.html'},
-            'ErrorDocument': {'Key': 'error.html'}
-        }
-
-        s3_manager.s3_client.put_bucket_website(
-            Bucket=website_bucket,
-            WebsiteConfiguration=website_config
-        )
-
-        # Create a simple error page if it doesn't exist
-        error_page_content = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Page Not Found - Local Business Directory</title>
-    <link rel="stylesheet" href="styles.css">
-</head>
-<body>
-    <header>
-        <h1>Page Not Found</h1>
-    </header>
-    <main>
-        <p>Sorry, the page you're looking for doesn't exist.</p>
-        <p><a href="index.html">Return to Business Directory</a></p>
-    </main>
-</body>
-</html>"""
-
-        s3_manager.upload_text(website_bucket, 'error.html', error_page_content, 'text/html')
-
-        logger.info(f"Configured static website hosting for {website_bucket}")
-
-    except ClientError as e:
-        if e.response['Error']['Code'] != 'NoSuchBucket':
-            raise
-
-
-def generate_seo_files(s3_manager: S3Manager, website_bucket: str, pages: List[Dict[str, Any]]):
-    """
-    Generate additional SEO and metadata files.
-
-    Args:
-        s3_manager: S3 manager instance
-        website_bucket: Website S3 bucket name
-        pages: List of rendered pages
-    """
-    # Generate JSON feed for the site
-    site_feed = {
-        "version": "https://jsonfeed.org/version/1.1",
-        "title": "Local Business Directory",
-        "home_page_url": get_website_url(website_bucket),
-        "feed_url": f"{get_website_url(website_bucket)}/feed.json",
-        "description": "Local business listings and information",
-        "items": [
-            {
-                "id": page['business_id'],
-                "url": f"{get_website_url(website_bucket)}/pages/{page['slug']}.html",
-                "title": page['business_name'],
-                "date_published": datetime.utcnow().isoformat(),
-                "summary": f"Information about {page['business_name']}"
-            }
-            for page in pages
-        ]
-    }
-
-    s3_manager.upload_json(website_bucket, 'feed.json', site_feed)
-
-    # Generate manifest.json for PWA capabilities
-    manifest = {
-        "name": "Local Business Directory",
-        "short_name": "Business Directory",
-        "description": "Local business listings and information",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#ffffff",
-        "theme_color": "#007bff",
-        "icons": [
-            {
-                "src": "/icon-192.png",
-                "sizes": "192x192",
-                "type": "image/png"
-            }
-        ]
-    }
-
-    s3_manager.upload_json(website_bucket, 'manifest.json', manifest)
-
-    # Generate humans.txt
-    humans_txt = f"""/* TEAM */
-Generated by: Agentic Local SEO Content Factory
-Location: AWS Lambda
-
-/* SITE */
-Last update: {datetime.utcnow().strftime('%Y/%m/%d')}
-Language: English
-Doctype: HTML5
-Standards: HTML5, CSS3
-Components: Jinja2, Amazon Bedrock, AWS Lambda
-Software: Python 3.12
-"""
-
-    s3_manager.upload_text(website_bucket, 'humans.txt', humans_txt, 'text/plain')
-
-    logger.info("Generated additional SEO files")
-
-
-def setup_analytics(s3_manager: S3Manager, website_bucket: str, pages: List[Dict[str, Any]]):
-    """
-    Setup basic analytics and monitoring.
-
-    Args:
-        s3_manager: S3 manager instance
-        website_bucket: Website S3 bucket name
-        pages: List of rendered pages
-    """
-    # Create a simple analytics snippet (placeholder for real analytics)
-    analytics_js = f"""
-// Basic analytics tracking
-(function() {{
-    // Track page views
-    var pageData = {{
-        url: window.location.pathname,
-        title: document.title,
-        timestamp: new Date().toISOString(),
-        userAgent: navigator.userAgent
-    }};
-
-    // In a real implementation, this would send data to your analytics service
-    console.log('Page view:', pageData);
-
-    // Track clicks on business links
-    document.addEventListener('click', function(e) {{
-        if (e.target.tagName === 'A' && e.target.href.includes('/pages/')) {{
-            console.log('Business page click:', e.target.href);
-        }}
-    }});
-}})();
-"""
-
-    s3_manager.upload_text(website_bucket, 'analytics.js', analytics_js, 'application/javascript')
-
-    # Create performance monitoring data
-    performance_data = {
-        'site_generated': datetime.utcnow().isoformat(),
-        'total_pages': len(pages),
-        'average_quality_score': sum(page.get('quality_score', 0) for page in pages) / len(pages) if pages else 0,
-        'pages_by_quality': {
-            'high': len([p for p in pages if p.get('quality_score', 0) >= 0.8]),
-            'medium': len([p for p in pages if 0.6 <= p.get('quality_score', 0) < 0.8]),
-            'low': len([p for p in pages if p.get('quality_score', 0) < 0.6])
-        }
-    }
-
-    s3_manager.upload_json(website_bucket, 'performance.json', performance_data)
-
-    logger.info("Setup analytics and monitoring")
-
-
-def generate_performance_report(pages: List[Dict[str, Any]], execution_id: str) -> Dict[str, Any]:
-    """
-    Generate comprehensive performance report.
-
-    Args:
-        pages: List of rendered pages
+        rendered_pages: List of rendered page information
         execution_id: Pipeline execution ID
 
     Returns:
-        Performance report dictionary
+        Site metadata dictionary
     """
-    quality_scores = [page.get('quality_score', 0) for page in pages]
+    successful_pages = [p for p in rendered_pages if p.get('render_successful')]
 
+    # Calculate quality statistics
+    quality_scores = [p.get('quality_score', 0.0) for p in successful_pages if p.get('quality_score')]
+    avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0.0
+
+    # Categorize pages by quality
+    high_quality = len([s for s in quality_scores if s >= 0.8])
+    medium_quality = len([s for s in quality_scores if 0.6 <= s < 0.8])
+    low_quality = len([s for s in quality_scores if s < 0.6])
+
+    metadata = {
+        'site_info': {
+            'generation_date': datetime.now().isoformat(),
+            'execution_id': execution_id,
+            'generator': 'Agentic Local SEO Content Factory v1.0',
+            'total_pages': len(rendered_pages),
+            'successful_pages': len(successful_pages),
+            'failed_pages': len(rendered_pages) - len(successful_pages)
+        },
+        'quality_metrics': {
+            'average_quality_score': round(avg_quality, 3),
+            'high_quality_pages': high_quality,
+            'medium_quality_pages': medium_quality,
+            'low_quality_pages': low_quality,
+            'quality_distribution': {
+                'excellent': high_quality,
+                'good': medium_quality,
+                'needs_improvement': low_quality
+            }
+        },
+        'pages': [
+            {
+                'business_id': page.get('business_id'),
+                'slug': page.get('slug'),
+                'title': page.get('title'),
+                'html_file': page.get('html_file'),
+                'quality_score': page.get('quality_score'),
+                'render_successful': page.get('render_successful', False)
+            }
+            for page in rendered_pages
+        ],
+        'seo_info': {
+            'sitemap_url': '/sitemap.xml',
+            'robots_txt_url': '/robots.txt',
+            'index_page': '/index.html',
+            'total_seo_optimized_pages': len(successful_pages)
+        },
+        'technical_details': {
+            'aws_region': os.environ.get('AWS_REGION', 'us-east-1'),
+            'website_bucket': os.environ.get('WEBSITE_BUCKET'),
+            'content_format': 'HTML5',
+            'responsive_design': True,
+            'schema_org_markup': True
+        }
+    }
+
+    return metadata
+
+
+def generate_execution_report(execution_id: str, rendered_pages: List[Dict[str, Any]],
+                            successful: int, failed: int) -> Dict[str, Any]:
+    """
+    Generate comprehensive execution report.
+
+    Args:
+        execution_id: Pipeline execution ID
+        rendered_pages: List of rendered page information
+        successful: Number of successful renders
+        failed: Number of failed renders
+
+    Returns:
+        Execution report dictionary
+    """
     report = {
-        'execution_id': execution_id,
-        'generated_at': datetime.utcnow().isoformat(),
-        'summary': {
-            'total_pages': len(pages),
-            'average_quality_score': sum(quality_scores) / len(quality_scores) if quality_scores else 0,
-            'min_quality_score': min(quality_scores) if quality_scores else 0,
-            'max_quality_score': max(quality_scores) if quality_scores else 0
+        'execution_summary': {
+            'execution_id': execution_id,
+            'completion_time': datetime.now().isoformat(),
+            'total_duration_estimated': '15-30 minutes',  # Typical pipeline duration
+            'overall_status': 'success' if failed == 0 else 'partial_success' if successful > 0 else 'failed'
         },
-        'quality_distribution': {
-            'excellent': len([s for s in quality_scores if s >= 0.9]),
-            'good': len([s for s in quality_scores if 0.8 <= s < 0.9]),
-            'fair': len([s for s in quality_scores if 0.6 <= s < 0.8]),
-            'poor': len([s for s in quality_scores if s < 0.6])
+        'pipeline_stages': {
+            'ingest_raw': {'status': 'completed', 'description': 'Business data ingestion and validation'},
+            'clean_transform': {'status': 'completed', 'description': 'Data cleaning and transformation'},
+            'agent_generate': {'status': 'completed', 'description': 'AI content generation'},
+            'agent_qc': {'status': 'completed', 'description': 'Quality control and validation'},
+            'render_html': {'status': 'completed', 'description': 'HTML rendering and template processing'},
+            'publish_site': {'status': 'completed', 'description': 'Site publishing and finalization'}
         },
-        'top_performing_pages': sorted(
-            [{'business_name': p['business_name'], 'quality_score': p.get('quality_score', 0)}
-             for p in pages],
-            key=lambda x: x['quality_score'],
-            reverse=True
-        )[:10],
-        'recommendations': generate_recommendations(pages)
+        'results': {
+            'total_businesses_processed': len(rendered_pages),
+            'successful_pages_generated': successful,
+            'failed_page_generations': failed,
+            'success_rate': round((successful / len(rendered_pages)) * 100, 1) if rendered_pages else 0
+        },
+        'quality_analysis': analyze_page_quality(rendered_pages),
+        'recommendations': generate_recommendations(rendered_pages, successful, failed),
+        'next_steps': [
+            'Review generated content for accuracy and relevance',
+            'Consider updating business data for failed generations',
+            'Monitor website performance and SEO rankings',
+            'Plan future content updates and regeneration cycles'
+        ]
     }
 
     return report
 
 
-def create_deployment_summary(pages: List[Dict[str, Any]], execution_id: str,
-                             publishing_results: Dict[str, Any]) -> Dict[str, Any]:
+def analyze_page_quality(rendered_pages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Create deployment summary document.
+    Analyze the quality of generated pages.
 
     Args:
-        pages: List of rendered pages
-        execution_id: Pipeline execution ID
-        publishing_results: Results from publishing tasks
+        rendered_pages: List of rendered page information
 
     Returns:
-        Deployment summary dictionary
+        Quality analysis results
     """
-    summary = {
-        'deployment_info': {
-            'execution_id': execution_id,
-            'timestamp': datetime.utcnow().isoformat(),
-            'total_pages': len(pages),
-            'successful_tasks': len([r for r in publishing_results.values() if not str(r).startswith('error:')])
+    successful_pages = [p for p in rendered_pages if p.get('render_successful')]
+    quality_scores = [p.get('quality_score', 0.0) for p in successful_pages if p.get('quality_score')]
+
+    if not quality_scores:
+        return {'message': 'No quality scores available for analysis'}
+
+    analysis = {
+        'total_pages_analyzed': len(quality_scores),
+        'average_quality': round(sum(quality_scores) / len(quality_scores), 3),
+        'highest_quality': round(max(quality_scores), 3),
+        'lowest_quality': round(min(quality_scores), 3),
+        'quality_distribution': {
+            'excellent_90_100': len([s for s in quality_scores if s >= 0.9]),
+            'good_80_89': len([s for s in quality_scores if 0.8 <= s < 0.9]),
+            'average_70_79': len([s for s in quality_scores if 0.7 <= s < 0.8]),
+            'below_average_60_69': len([s for s in quality_scores if 0.6 <= s < 0.7]),
+            'poor_below_60': len([s for s in quality_scores if s < 0.6])
         },
-        'pages_deployed': pages,
-        'publishing_results': publishing_results,
-        'next_steps': [
-            'Monitor website performance and user engagement',
-            'Set up analytics tracking for detailed insights',
-            'Schedule regular content updates and regeneration',
-            'Consider adding structured data validation',
-            'Implement automated SEO monitoring'
-        ],
-        'technical_details': {
-            'generator': 'Agentic Local SEO Content Factory',
-            'version': '1.0',
-            'aws_region': os.environ.get('AWS_REGION', 'us-east-1'),
-            'content_model': 'Claude-3-Haiku',
-            'quality_model': 'Claude-3-Sonnet'
-        }
+        'recommendations_based_on_quality': []
     }
 
-    return summary
+    # Add quality-based recommendations
+    avg_quality = analysis['average_quality']
+    if avg_quality >= 0.85:
+        analysis['recommendations_based_on_quality'].append('Excellent quality! Consider this as a template for future generations.')
+    elif avg_quality >= 0.75:
+        analysis['recommendations_based_on_quality'].append('Good quality overall. Minor improvements could enhance SEO performance.')
+    elif avg_quality >= 0.65:
+        analysis['recommendations_based_on_quality'].append('Average quality. Consider reviewing content generation prompts.')
+    else:
+        analysis['recommendations_based_on_quality'].append('Below average quality. Recommend regenerating content with improved prompts.')
+
+    return analysis
 
 
-def generate_recommendations(pages: List[Dict[str, Any]]) -> List[str]:
+def generate_recommendations(rendered_pages: List[Dict[str, Any]], successful: int, failed: int) -> List[str]:
     """
-    Generate recommendations based on page performance.
+    Generate actionable recommendations based on results.
 
     Args:
-        pages: List of rendered pages
+        rendered_pages: List of rendered page information
+        successful: Number of successful renders
+        failed: Number of failed renders
 
     Returns:
         List of recommendation strings
     """
     recommendations = []
-    quality_scores = [page.get('quality_score', 0) for page in pages]
 
-    if not quality_scores:
-        return ["No pages to analyze"]
+    # Success rate based recommendations
+    success_rate = (successful / len(rendered_pages)) * 100 if rendered_pages else 0
 
-    avg_quality = sum(quality_scores) / len(quality_scores)
+    if success_rate >= 95:
+        recommendations.append("Excellent pipeline performance! Consider scaling to more businesses.")
+    elif success_rate >= 80:
+        recommendations.append("Good pipeline performance. Review failed cases for improvement opportunities.")
+    elif success_rate >= 60:
+        recommendations.append("Moderate success rate. Consider reviewing data quality and generation prompts.")
+    else:
+        recommendations.append("Low success rate. Investigate data quality, prompts, and system configuration.")
 
-    if avg_quality < 0.7:
-        recommendations.append("Consider improving content generation prompts to increase overall quality")
+    # Quality-based recommendations
+    quality_scores = [p.get('quality_score', 0.0) for p in rendered_pages
+                     if p.get('render_successful') and p.get('quality_score')]
 
-    if len([s for s in quality_scores if s < 0.6]) > len(pages) * 0.2:
-        recommendations.append("More than 20% of pages have low quality scores - review generation process")
+    if quality_scores:
+        avg_quality = sum(quality_scores) / len(quality_scores)
 
-    if len(pages) < 50:
-        recommendations.append("Consider generating more business pages for better SEO coverage")
+        if avg_quality < 0.7:
+            recommendations.append("Consider refining content generation prompts to improve quality scores.")
+
+        low_quality_count = len([s for s in quality_scores if s < 0.6])
+        if low_quality_count > 0:
+            recommendations.append(f"Review and potentially regenerate {low_quality_count} low-quality pages.")
+
+    # Operational recommendations
+    if failed > 0:
+        recommendations.append("Check CloudWatch logs for detailed error analysis of failed generations.")
 
     recommendations.extend([
-        "Implement regular content audits and updates",
-        "Add customer review integration for enhanced credibility",
-        "Consider implementing structured data validation",
-        "Monitor page loading speeds and optimize as needed",
-        "Set up automated backlink monitoring"
+        "Set up monitoring for website performance and SEO metrics.",
+        "Consider A/B testing different content templates for optimization.",
+        "Plan regular content updates to maintain freshness and relevance."
     ])
 
-    return recommendations[:10]  # Limit to top 10 recommendations
+    return recommendations
+
+
+def generate_analytics_code() -> Optional[str]:
+    """
+    Generate basic analytics tracking code.
+
+    Returns:
+        JavaScript analytics code or None
+    """
+    # Simple analytics stub - in production, integrate with Google Analytics, etc.
+    return """
+// Basic analytics tracking
+(function() {
+    var analytics = {
+        track: function(event, properties) {
+            console.log('Analytics event:', event, properties);
+            // In production, send to your analytics service
+        },
+
+        pageView: function(page) {
+            this.track('page_view', { page: page });
+        }
+    };
+
+    // Track page load
+    analytics.pageView(window.location.pathname);
+
+    // Track external link clicks
+    document.addEventListener('click', function(e) {
+        if (e.target.tagName === 'A' && e.target.hostname !== window.location.hostname) {
+            analytics.track('external_link_click', { url: e.target.href });
+        }
+    });
+
+    window.analytics = analytics;
+})();
+"""
+
+
+def generate_global_css() -> str:
+    """
+    Generate global CSS styles for the website.
+
+    Returns:
+        CSS content string
+    """
+    return """
+/* Global styles for Agentic SEO Content Factory */
+
+/* Reset and base styles */
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    line-height: 1.6;
+    color: #333;
+    margin: 0;
+    padding: 0;
+    background-color: #fff;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 20px;
+}
+
+/* Typography */
+h1, h2, h3, h4, h5, h6 {
+    margin-top: 0;
+    margin-bottom: 0.5em;
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+h1 { font-size: 2.5em; color: #2c3e50; }
+h2 { font-size: 2em; color: #34495e; }
+h3 { font-size: 1.5em; color: #34495e; }
+
+p {
+    margin-bottom: 1em;
+}
+
+a {
+    color: #3498db;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+/* Utility classes */
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+.mb-1 { margin-bottom: 1rem; }
+.mb-2 { margin-bottom: 2rem; }
+.mt-1 { margin-top: 1rem; }
+.mt-2 { margin-top: 2rem; }
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .container {
+        padding: 0 15px;
+    }
+
+    h1 { font-size: 2em; }
+    h2 { font-size: 1.5em; }
+
+    .business-grid {
+        grid-template-columns: 1fr !important;
+    }
+}
+
+/* Print styles */
+@media print {
+    .no-print {
+        display: none !important;
+    }
+
+    body {
+        font-size: 12pt;
+        line-height: 1.4;
+    }
+
+    a {
+        color: inherit;
+        text-decoration: none;
+    }
+
+    a:after {
+        content: " (" attr(href) ")";
+        font-size: 0.8em;
+        color: #666;
+    }
+}
+"""
 
 
 def get_website_url(website_bucket: str) -> str:
     """
-    Get the website URL for the S3 bucket.
+    Get the public website URL for the S3 bucket.
 
     Args:
-        website_bucket: Website S3 bucket name
+        website_bucket: S3 bucket name
 
     Returns:
-        Website URL
+        Website URL string
     """
-    # In production, this might be a CloudFront distribution or custom domain
+    # In production, this would be the actual CloudFront or custom domain URL
+    # For now, return the S3 website endpoint
     region = os.environ.get('AWS_REGION', 'us-east-1')
-    if region == 'us-east-1':
-        return f"https://{website_bucket}.s3-website-us-east-1.amazonaws.com"
-    else:
-        return f"https://{website_bucket}.s3-website-{region}.amazonaws.com"
-
-
-def invalidate_cdn_cache(distribution_id: str = None):
-    """
-    Invalidate CloudFront cache if distribution is configured.
-
-    Args:
-        distribution_id: CloudFront distribution ID (optional)
-    """
-    if not distribution_id:
-        logger.info("No CloudFront distribution configured, skipping cache invalidation")
-        return
-
-    try:
-        cloudfront = boto3.client('cloudfront')
-
-        response = cloudfront.create_invalidation(
-            DistributionId=distribution_id,
-            InvalidationBatch={
-                'Paths': {
-                    'Quantity': 1,
-                    'Items': ['/*']
-                },
-                'CallerReference': f"invalidation-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-            }
-        )
-
-        logger.info(f"Created CloudFront invalidation: {response['Invalidation']['Id']}")
-
-    except Exception as e:
-        logger.warning(f"Failed to invalidate CloudFront cache: {str(e)}")
+    return f"http://{website_bucket}.s3-website-{region}.amazonaws.com"

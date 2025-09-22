@@ -39,99 +39,44 @@ def get_generation_prompt(business: Business, related_businesses: list = None) -
         for rb in related_businesses[:5]:  # Limit to 5 related businesses
             related_info += f"- {rb.name} ({rb.category}) - ID: {rb.business_id}\n"
 
-    prompt = f"""Create a COMPACT SEO page for: {business.name} ({business.category}) in {business.city}, {business.state}.
+    prompt = f"""Create a comprehensive SEO page for this local business:
 
-CRITICAL: Keep content brief but SEO-optimized. Total response must be under 2000 tokens.
-
-BUSINESS: {business.name}, {business.address}, {business.city}, {business.state} {business.zip_code}
-PHONE: {business.phone or business.zip_code+'123'}
-DESCRIPTION: {business.description or f'Professional {business.category.lower()} services'}
+BUSINESS DETAILS:
+- Name: {business.name}
+- Category: {business.category}
+- Address: {business.address}, {business.city}, {business.state} {business.zip_code}
+- Phone: {business.phone or 'Not provided'}
+- Website: {business.website or 'Not provided'}
+- Email: {business.email or 'Not provided'}
+- Description: {business.description or 'Not provided'}
+- Rating: {business.rating or 'Not provided'}/5.0
+- Reviews: {business.review_count or 'Not provided'} reviews
 
 {related_info}
 
-GENERATE COMPACT JSON with:
-1. URL slug (lowercase-hyphenated)
-2. SEO title (30-60 chars)
-3. Meta description (120-155 chars)
-4. H1 (25-60 chars)
-5. Content sections (300-500 words TOTAL):
-   - Brief intro (2-3 sentences)
-   - Services overview (3-4 sentences)
-   - Location info (2 sentences)
-   - Contact call-to-action (1-2 sentences)
-6. 1-2 internal links (if related businesses provided)
-7. Simple schema.org markup
-8. 4-6 local keywords
+REQUIREMENTS:
+1. Generate a URL-friendly slug (lowercase, hyphens only)
+2. Create SEO-optimized title (10-70 chars) and meta description (50-160 chars)
+3. Write engaging H1 (10-70 chars)
+4. Compose 800+ word main content covering:
+   - Business overview and unique value proposition
+   - Detailed service/product descriptions
+   - Location and service area information
+   - Customer experience and testimonials (generic but believable)
+   - Local community involvement
+5. Include 1-3 internal links to related businesses (if provided)
+6. Generate schema.org LocalBusiness JSON-LD markup
+7. Select 5-8 relevant local SEO keywords
 
-Generate the complete PageSpec JSON response with this exact structure:
+CONTENT GUIDELINES:
+- Write for local customers searching for {business.category} services
+- Emphasize location-specific benefits
+- Use natural, engaging language (not overly promotional)
+- Include relevant business hours, service areas, and contact information
+- Make content scannable with logical flow
+- Ensure all facts are generic but plausible for this business type
 
-{{
-  "business": {{
-    "business_id": "{business.business_id}",
-    "name": "{business.name}",
-    "category": "{business.category}",
-    "address": "{business.address}",
-    "city": "{business.city}",
-    "state": "{business.state}",
-    "zip_code": "{business.zip_code}",
-    "phone": "2175550123",
-    "website": "https://example.com",
-    "email": "contact@business.com",
-    "description": "Generated business description",
-    "rating": {business.rating or 'null'},
-    "review_count": {business.review_count or 'null'}
-  }},
-  "seo": {{
-    "title": "SEO title EXACTLY 10-70 characters",
-    "meta_description": "Meta description EXACTLY 50-160 characters",
-    "h1": "H1 heading EXACTLY 10-70 characters",
-    "slug": "url-friendly-slug",
-    "keywords": ["keyword1", "keyword2", "keyword3"]
-  }},
-  "content": {{
-    "introduction": "Page introduction EXACTLY 100-500 characters",
-    "main_content": "Main content section EXACTLY 800+ words minimum",
-    "services_section": "Services section MAXIMUM 1000 characters",
-    "location_section": "Location section MAXIMUM 800 characters",
-    "conclusion": "Page conclusion EXACTLY 100-400 characters"
-  }},
-  "jsonld": {{
-    "@context": "https://schema.org",
-    "@type": "LocalBusiness",
-    "name": "{business.name}",
-    "description": "Business description",
-    "address": {{
-      "@type": "PostalAddress",
-      "streetAddress": "{business.address}",
-      "addressLocality": "{business.city}",
-      "addressRegion": "{business.state}",
-      "postalCode": "{business.zip_code}"
-    }},
-    "telephone": "{business.phone or ''}",
-    "url": "{business.website or ''}",
-    "email": "{business.email or ''}"
-  }},
-  "internal_links": [
-    {{
-      "url": "/related-business-slug",
-      "anchor_text": "Related Business Name",
-      "target_business_id": "related_business_id"
-    }}
-  ]
-}}
-
-CRITICAL REQUIREMENTS:
-1. Return ONLY valid JSON - no markdown formatting, no explanations, no extra text
-2. All text content must use proper JSON escaping for quotes and special characters
-3. No control characters (tabs, newlines) inside JSON string values
-4. Phone numbers MUST be strings: "2175550123" (not 2175550123)
-5. Use null (not "null") for missing email/phone/website values
-6. Strictly adhere to character limits - count characters before including
-
-EXAMPLES:
-"phone": "2175550123"  (string, not number)
-"email": null  (not "null" string)
-"website": null  (not "null" string)"""
+Generate the complete PageSpec JSON response:"""
 
     return prompt
 

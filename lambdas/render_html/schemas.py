@@ -19,6 +19,7 @@ class Business(BaseModel):
     state: str = Field(..., min_length=2, max_length=50)
     zip_code: str = Field(..., pattern=r'^\d{5}(-\d{4})?$')
     phone: Optional[Any] = None
+    
     website: Optional[HttpUrl] = None
     email: Optional[str] = Field(None, pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
     description: Optional[str] = Field(None, max_length=1000)

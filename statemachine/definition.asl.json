@@ -1,5 +1,5 @@
 {
-  "Comment": "Agentic Local SEO Content Factory - End-to-end content generation pipeline",
+  "Comment": "Agentic Local SEO Content Factory - Simplified end-to-end content generation pipeline",
   "StartAt": "IngestRawData",
   "States": {
     "IngestRawData": {
@@ -8,6 +8,12 @@
       "Parameters": {
         "FunctionName": "${IngestRawFunctionArn}",
         "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "execution_id.$": "$.Payload.execution_id",
+        "output_file.$": "$.Payload.output_file",
+        "total_rows.$": "$.Payload.total_rows",
+        "valid_businesses.$": "$.Payload.valid_businesses"
       },
       "ResultPath": "$.ingest_result",
       "Next": "CleanTransformData",
@@ -32,10 +38,19 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${CleanTransformFunctionArn}",
-        "Payload.$": "$"
+        "Payload": {
+          "execution_id.$": "$.ingest_result.execution_id",
+          "output_file.$": "$.ingest_result.output_file",
+          "source_file.$": "$.file_key"
+        }
+      },
+      "ResultSelector": {
+        "execution_id.$": "$.Payload.execution_id",
+        "output_file.$": "$.Payload.output_file",
+        "total_rows.$": "$.Payload.total_rows"
       },
       "ResultPath": "$.transform_result",
-      "Next": "ProcessBusinessesBatch",
+      "Next": "GenerateContent",
       "Retry": [
         {
           "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
@@ -52,97 +67,103 @@
         }
       ]
     },
-    "ProcessBusinessesBatch": {
-      "Type": "Map",
-      "ItemsPath": "$.transform_result.Payload.businesses",
-      "MaxConcurrency": 5,
-      "Iterator": {
-        "StartAt": "GeneratePageContent",
-        "States": {
-          "GeneratePageContent": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::lambda:invoke",
-            "Parameters": {
-              "FunctionName": "${AgentGenerateFunctionArn}",
-              "Payload.$": "$"
-            },
-            "ResultPath": "$.generate_result",
-            "Next": "QualityCheckContent",
-            "Retry": [
-              {
-                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
-                "IntervalSeconds": 2,
-                "MaxAttempts": 3,
-                "BackoffRate": 2.0
-              }
-            ]
-          },
-          "QualityCheckContent": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::lambda:invoke",
-            "Parameters": {
-              "FunctionName": "${AgentQcFunctionArn}",
-              "Payload.$": "$"
-            },
-            "ResultPath": "$.qc_result",
-            "Next": "CheckQualityScore",
-            "Retry": [
-              {
-                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
-                "IntervalSeconds": 2,
-                "MaxAttempts": 3,
-                "BackoffRate": 2.0
-              }
-            ]
-          },
-          "CheckQualityScore": {
-            "Type": "Choice",
-            "Choices": [
-              {
-                "Variable": "$.qc_result.Payload.quality_score",
-                "NumericGreaterThanEquals": 0.8,
-                "Next": "ContentApproved"
-              },
-              {
-                "Variable": "$.qc_result.Payload.retry_count",
-                "NumericGreaterThanEquals": 3,
-                "Next": "ContentApproved"
-              }
-            ],
-            "Default": "RegenerateContent"
-          },
-          "RegenerateContent": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::lambda:invoke",
-            "Parameters": {
-              "FunctionName": "${AgentGenerateFunctionArn}",
-              "Payload": {
-                "business.$": "$.business",
-                "feedback.$": "$.qc_result.Payload.feedback",
-                "retry_count.$": "$.qc_result.Payload.retry_count"
-              }
-            },
-            "ResultPath": "$.generate_result",
-            "Next": "QualityCheckContent"
-          },
-          "ContentApproved": {
-            "Type": "Pass",
-            "End": true
-          }
+    "GenerateContent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AgentGenerateFunctionArn}",
+        "Payload": {
+          "execution_id.$": "$.transform_result.execution_id",
+          "output_file.$": "$.transform_result.output_file"
         }
       },
-      "ResultPath": "$.processed_businesses",
-      "Next": "RenderAllPages"
+      "ResultSelector": {
+        "execution_id.$": "$.Payload.execution_id",
+        "output_file.$": "$.Payload.output_file",
+        "successful_generations.$": "$.Payload.successful_generations",
+        "failed_generations.$": "$.Payload.failed_generations"
+      },
+      "ResultPath": "$.generate_result",
+      "Next": "CheckGenerationSuccess",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError",
+          "ResultPath": "$.error"
+        }
+      ]
     },
-    "RenderAllPages": {
+    "CheckGenerationSuccess": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.generate_result.successful_generations",
+          "NumericEquals": 0,
+          "Next": "HandleError"
+        }
+      ],
+      "Default": "QualityCheck"
+    },
+    "QualityCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AgentQcFunctionArn}",
+        "Payload": {
+          "execution_id.$": "$.generate_result.execution_id",
+          "output_file.$": "$.generate_result.output_file"
+        }
+      },
+      "ResultSelector": {
+        "execution_id.$": "$.Payload.execution_id",
+        "output_file.$": "$.Payload.output_file",
+        "successful_qc.$": "$.Payload.successful_qc",
+        "failed_qc.$": "$.Payload.failed_qc"
+      },
+      "ResultPath": "$.qc_result",
+      "Next": "RenderHTML",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "RenderHTML": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${RenderHtmlFunctionArn}",
-        "Payload.$": "$"
+        "Payload": {
+          "execution_id.$": "$.qc_result.execution_id",
+          "output_file.$": "$.qc_result.output_file"
+        }
+      },
+      "ResultSelector": {
+        "execution_id.$": "$.Payload.execution_id",
+        "output_file.$": "$.Payload.output_file",
+        "successful_renders.$": "$.Payload.successful_renders",
+        "failed_renders.$": "$.Payload.failed_renders"
       },
       "ResultPath": "$.render_result",
-      "Next": "PublishWebsite",
+      "Next": "PublishSite",
       "Retry": [
         {
           "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
@@ -159,12 +180,22 @@
         }
       ]
     },
-    "PublishWebsite": {
+    "PublishSite": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${PublishSiteFunctionArn}",
-        "Payload.$": "$"
+        "Payload": {
+          "execution_id.$": "$.render_result.execution_id",
+          "output_file.$": "$.render_result.output_file"
+        }
+      },
+      "ResultSelector": {
+        "execution_id.$": "$.Payload.execution_id",
+        "website_url.$": "$.Payload.website_url",
+        "successful_renders.$": "$.Payload.successful_renders",
+        "failed_renders.$": "$.Payload.failed_renders",
+        "execution_report_file.$": "$.Payload.execution_report_file"
       },
       "ResultPath": "$.publish_result",
       "Next": "Success",

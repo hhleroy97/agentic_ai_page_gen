@@ -17,10 +17,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Add common modules to path
-import sys
-sys.path.append('/opt/python')
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'common'))
-
 from schemas import Business, PipelineStatus
 from s3_utils import S3Manager
 
@@ -170,17 +166,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # Save pipeline status
         pipeline_status.stage = 'completed'
-        s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+        try:
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            logger.info("Pipeline status saved successfully")
+        except Exception as e:
+            logger.warning(f"Failed to save pipeline status: {str(e)} - continuing anyway")
+            # Don't fail the entire function for status save issues
 
-        # Prepare response
+        # Prepare response - ensure everything is JSON serializable
         response = {
             'statusCode': 200,
             'execution_id': execution_id,
             'total_rows': len(df),
             'valid_businesses': len(businesses),
             'validation_errors': len(validation_errors),
-            'output_file': output_key,
-            'businesses': businesses
+            'output_file': output_key
+            # Note: Don't include 'businesses' in response to avoid serialization issues
         }
 
         logger.info(f"Raw data ingestion completed successfully: {len(businesses)} businesses processed")
@@ -195,8 +196,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             pipeline_status.stage = 'failed'
             pipeline_status.errors.append(error_msg)
             s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
-        except:
-            logger.error("Failed to save pipeline status")
+        except Exception as status_error:
+            logger.error(f"Failed to save pipeline status: {str(status_error)}")
 
         return {
             'statusCode': 500,
@@ -229,10 +230,16 @@ def validate_business_data(business_dict: Dict[str, Any]) -> Business:
     # Clean phone number
     if 'phone' in business_dict and business_dict['phone']:
         phone = str(business_dict['phone']).strip()
-        # Remove common formatting
-        phone = phone.replace('(', '').replace(')', '').replace('-', '').replace(' ', '').replace('.', '')
-        if len(phone) == 10:
-            phone = f"({phone[:3]}) {phone[3:6]}-{phone[6:]}"
+        # Remove all non-digit characters
+        digits_only = ''.join(filter(str.isdigit, phone))
+        
+        # Format as xxx-xxx-xxxx if we have 10 digits
+        if len(digits_only) == 10:
+            phone = f"{digits_only[:3]}-{digits_only[3:6]}-{digits_only[6:]}"
+        elif len(digits_only) == 11 and digits_only[0] == '1':
+            # Handle 11-digit numbers starting with 1 (US country code)
+            phone = f"{digits_only[1:4]}-{digits_only[4:7]}-{digits_only[7:]}"
+        
         business_dict['phone'] = phone if phone else None
 
     # Validate website URL format

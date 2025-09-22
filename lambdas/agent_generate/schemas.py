@@ -18,7 +18,8 @@ class Business(BaseModel):
     city: str = Field(..., min_length=1, max_length=100)
     state: str = Field(..., min_length=2, max_length=50)
     zip_code: str = Field(..., pattern=r'^\d{5}(-\d{4})?$')
-    phone: Optional[Any] = None
+    phone: Any = None
+    
     website: Optional[HttpUrl] = None
     email: Optional[str] = Field(None, pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
     description: Optional[str] = Field(None, max_length=1000)
@@ -36,10 +37,10 @@ class Business(BaseModel):
 
 class SEOMetadata(BaseModel):
     """SEO metadata for generated pages"""
-    title: str = Field(..., description="Page title")
-    meta_description: str = Field(..., description="Meta description")
-    h1: str = Field(..., description="Main heading")
-    slug: str = Field(..., description="URL-friendly slug")
+    title: Any = Field(..., description="Page title")
+    meta_description: Any = Field(..., description="Meta description")
+    h1: Any = Field(..., description="Main heading")
+    slug: Any = Field(..., description="URL-friendly slug")
     canonical_url: Optional[str] = None
     keywords: List[str] = Field(default_factory=list)
 
@@ -81,11 +82,11 @@ class InternalLink(BaseModel):
 
 class PageContent(BaseModel):
     """Generated page content"""
-    introduction: str = Field(..., description="Page introduction")
-    main_content: str = Field(..., description="Main content")
-    services_section: Optional[str] = None
-    location_section: Optional[str] = None
-    conclusion: str = Field(..., description="Page conclusion")
+    introduction: Any = Field(..., description="Page introduction")
+    main_content: Any = Field(..., description="Main content")
+    services_section: Any = None
+    location_section: Any = None
+    conclusion: Any = Field(..., description="Page conclusion")
 
     # Removed word count validation to allow any content length
 

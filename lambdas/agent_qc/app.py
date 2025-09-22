@@ -1,382 +1,400 @@
 """
-Quality control Lambda function using Amazon Bedrock.
-Reviews and evaluates generated content, providing feedback for improvements.
+AI Quality Control Lambda function.
+Reviews and validates generated content using Amazon Bedrock LLMs.
 """
 
 import json
 import os
 import logging
-from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
+from typing import Dict, Any, List, Optional
+import boto3
+from botocore.exceptions import ClientError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Add common modules to path
-import sys
-sys.path.append('/opt/python')
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'common'))
-
-from schemas import PageSpec, QualityFeedback, GenerationTrace
+from schemas import Business, PageSpec, PipelineStatus, GenerationTrace, QualityFeedback
+from s3_utils import S3Manager
 from bedrock_client import BedrockClient
 from prompts import get_quality_check_prompt, calculate_quality_score
-from s3_utils import S3Manager
-from seo_rules import SEOValidator
+from seo_rules import validate_seo_compliance
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Lambda handler for quality control of generated content.
+    Lambda handler for AI quality control.
 
     Args:
-        event: Lambda event containing generated PageSpec
+        event: Lambda event (Step Functions input)
         context: Lambda context
 
     Returns:
-        Dictionary with quality assessment results
+        Dictionary with QC results
     """
-    logger.info(f"Starting quality control check")
+    logger.info(f"Starting AI quality control with event: {json.dumps(event, default=str)}")
 
     try:
-        # Initialize services
-        bedrock_client = BedrockClient(region_name=os.environ.get('BEDROCK_REGION', 'us-east-1'))
+        # Initialize clients
         s3_manager = S3Manager(region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-        seo_validator = SEOValidator()
+        bedrock_client = BedrockClient(region_name=os.environ.get('BEDROCK_REGION', 'us-east-1'))
 
-        # Get environment variables
+        # Get bucket names from environment
         processed_bucket = os.environ['PROCESSED_BUCKET']
 
-        # Extract data from event
-        generation_result = event.get('generate_result', {}).get('Payload', {})
-        if not generation_result:
-            raise ValueError("No generation result found in event")
+        # Extract parameters from event
+        execution_id = event.get('execution_id', context.aws_request_id)
+        input_file = event.get('output_file')  # From agent_generate step
 
-        page_spec_data = generation_result.get('page_spec')
-        if not page_spec_data:
-            raise ValueError("No page spec found in generation result")
+        if not input_file:
+            raise Exception("No input file specified from previous step")
 
-        # Parse PageSpec
-        page_spec = PageSpec(**page_spec_data)
-        business_id = page_spec.business.business_id
-        current_retry_count = event.get('retry_count', generation_result.get('retry_count', 0))
-
-        logger.info(f"Quality checking content for: {page_spec.business.name}")
-
-        # Perform comprehensive quality assessment
-        quality_feedback, qc_trace = perform_quality_assessment(
-            bedrock_client=bedrock_client,
-            page_spec=page_spec,
-            seo_validator=seo_validator,
-            retry_count=current_retry_count
+        # Initialize pipeline status
+        pipeline_status = PipelineStatus(
+            execution_id=execution_id,
+            stage='agent_qc',
+            total_businesses=0
         )
 
-        if not quality_feedback:
-            error_msg = f"Failed to perform quality assessment for business {business_id}"
+        # Download generated content data
+        logger.info(f"Downloading generated content: s3://{processed_bucket}/{input_file}")
+        generated_data = s3_manager.download_json(processed_bucket, input_file)
+
+        if not generated_data:
+            error_msg = f"Failed to download generated content from {input_file}"
             logger.error(error_msg)
+            pipeline_status.errors.append(error_msg)
+            pipeline_status.stage = 'failed'
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            raise Exception(error_msg)
 
-            # Save trace for debugging
-            s3_manager.save_generation_trace(processed_bucket, qc_trace)
+        generated_pages = generated_data.get('generated_pages', [])
+        pipeline_status.total_businesses = len(generated_pages)
 
-            return {
-                'statusCode': 500,
-                'business_id': business_id,
-                'error': error_msg,
-                'quality_score': 0.0,
-                'retry_count': current_retry_count + 1
-            }
+        logger.info(f"Processing {len(generated_pages)} generated pages for quality control")
 
-        # Update retry count
-        quality_feedback.retry_count = current_retry_count + 1
+        # Quality check each generated page
+        qc_results = []
+        qc_traces = []
+        successful_qc = 0
+        failed_qc = 0
+        pages_needing_regeneration = 0
+        processed_business_ids = set()  # Track processed businesses to avoid duplicates
 
-        # Determine if regeneration is needed
-        quality_threshold = 0.8
-        max_retries = 3
+        for idx, page_data in enumerate(generated_pages):
+            try:
+                business_id = page_data['business_id']
+                generation_successful = page_data.get('generation_successful', False)
 
-        quality_feedback.needs_regeneration = (
-            quality_feedback.quality_score < quality_threshold and
-            quality_feedback.retry_count <= max_retries
-        )
+                # Skip duplicates - only process each business once
+                if business_id in processed_business_ids:
+                    logger.info(f"Skipping duplicate business: {business_id}")
+                    continue
+                processed_business_ids.add(business_id)
 
-        # Save quality assessment results
-        qc_key = f"quality_checks/{business_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-        qc_data = {
-            'business_id': business_id,
-            'assessment_timestamp': datetime.utcnow().isoformat(),
-            'quality_feedback': quality_feedback.dict(),
-            'page_spec_summary': {
-                'title': page_spec.seo.title,
-                'word_count': len(page_spec.content.main_content.split()),
-                'generated_at': page_spec.generated_at.isoformat()
-            }
+                if not generation_successful:
+                    logger.info(f"Skipping QC for {business_id} - generation failed")
+                    qc_results.append({
+                        'business_id': business_id,
+                        'qc_successful': False,
+                        'reason': 'generation_failed',
+                        'quality_feedback': None
+                    })
+                    failed_qc += 1
+                    continue
+
+                page_spec_dict = page_data.get('page_spec')
+                if not page_spec_dict:
+                    error_msg = f"No page spec found for {business_id}"
+                    logger.error(error_msg)
+                    qc_results.append({
+                        'business_id': business_id,
+                        'qc_successful': False,
+                        'reason': 'no_page_spec',
+                        'quality_feedback': None
+                    })
+                    failed_qc += 1
+                    continue
+
+                # Convert dict back to PageSpec object for validation
+                page_spec = PageSpec(**page_spec_dict)
+                logger.info(f"Running QC for: {page_spec.business.name}")
+
+                # Perform technical SEO validation
+                seo_violations = validate_seo_compliance(page_spec)
+
+                # Perform AI-powered quality assessment
+                quality_feedback, trace = bedrock_client.quality_check_content(
+                    content_data=page_spec_dict,
+                    business_id=business_id,
+                    model_name='claude-3-haiku'
+                )
+
+                if quality_feedback:
+                    try:
+                        # Validate quality feedback
+                        qf = QualityFeedback(**quality_feedback)
+
+                        # Combine technical and AI assessments
+                        combined_feedback = combine_assessments(qf, seo_violations)
+
+                        # Determine if regeneration is needed
+                        needs_regeneration = (
+                            combined_feedback.quality_score < 0.7 or
+                            combined_feedback.needs_regeneration or
+                            len(seo_violations) > 2
+                        )
+
+                        if needs_regeneration:
+                            pages_needing_regeneration += 1
+
+                        qc_results.append({
+                            'business_id': business_id,
+                            'qc_successful': True,
+                            'quality_feedback': combined_feedback.dict(),
+                            'seo_violations': seo_violations,
+                            'needs_regeneration': needs_regeneration
+                        })
+                        successful_qc += 1
+
+                        logger.info(f"QC completed for {page_spec.get('business', {}).get('name', 'Unknown')} - Score: {combined_feedback.quality_score}")
+
+                    except Exception as validation_error:
+                        error_msg = f"Quality feedback validation failed for {business_id}: {str(validation_error)}"
+                        trace.errors.append(error_msg)
+                        logger.error(error_msg)
+
+                        qc_results.append({
+                            'business_id': business_id,
+                            'qc_successful': False,
+                            'reason': 'qc_validation_failed',
+                            'quality_feedback': None
+                        })
+                        failed_qc += 1
+                else:
+                    error_msg = f"Quality check failed for {business_id}"
+                    logger.error(error_msg)
+
+                    qc_results.append({
+                        'business_id': business_id,
+                        'qc_successful': False,
+                        'reason': 'qc_failed',
+                        'quality_feedback': None
+                    })
+                    failed_qc += 1
+
+                # Store QC trace
+                qc_traces.append(trace.dict())
+
+            except Exception as e:
+                error_msg = f"Error during QC setup for page {idx + 1}: {str(e)}"
+                logger.error(error_msg)
+                pipeline_status.errors.append(error_msg)
+
+                # Only increment failed_qc if we haven't already processed this business
+                qc_results.append({
+                    'business_id': page_data.get('business_id', f'unknown_{idx}'),
+                    'qc_successful': False,
+                    'reason': 'qc_setup_failed',
+                    'quality_feedback': None
+                })
+                failed_qc += 1
+
+        # Update pipeline status
+        pipeline_status.processed_businesses = successful_qc
+
+        # Save QC results
+        output_key = f"content/qc_results_{execution_id}.json"
+        output_data = {
+            'execution_id': execution_id,
+            'source_file': input_file,
+            'total_pages': len(generated_pages),
+            'successful_qc': successful_qc,
+            'failed_qc': failed_qc,
+            'pages_needing_regeneration': pages_needing_regeneration,
+            'qc_results': qc_results,
+            'qc_traces': qc_traces,
+            'generated_pages': generated_pages  # Pass through for next step
         }
 
-        try:
-            s3_manager.upload_json(processed_bucket, qc_key, qc_data)
-            logger.info(f"Saved quality assessment to: {qc_key}")
-        except Exception as e:
-            logger.warning(f"Failed to save quality assessment: {str(e)}")
+        if not s3_manager.upload_json(processed_bucket, output_key, output_data):
+            error_msg = "Failed to save QC results"
+            logger.error(error_msg)
+            pipeline_status.errors.append(error_msg)
+            pipeline_status.stage = 'failed'
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            raise Exception(error_msg)
 
-        # Save QC trace
-        s3_manager.save_generation_trace(processed_bucket, qc_trace)
+        # Save pipeline status
+        pipeline_status.stage = 'completed'
+        try:
+            s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+            logger.info("Pipeline status saved successfully")
+        except Exception as e:
+            logger.warning(f"Failed to save pipeline status: {str(e)} - continuing anyway")
 
         # Prepare response
         response = {
             'statusCode': 200,
-            'business_id': business_id,
-            'business_name': page_spec.business.name,
-            'quality_score': quality_feedback.quality_score,
-            'passed_checks': quality_feedback.passed_checks,
-            'failed_checks': quality_feedback.failed_checks,
-            'suggestions': quality_feedback.suggestions,
-            'needs_regeneration': quality_feedback.needs_regeneration,
-            'retry_count': quality_feedback.retry_count,
-            'feedback': format_feedback_for_regeneration(quality_feedback),
-            'qc_key': qc_key
+            'execution_id': execution_id,
+            'total_pages': len(generated_pages),
+            'successful_qc': successful_qc,
+            'failed_qc': failed_qc,
+            'pages_needing_regeneration': pages_needing_regeneration,
+            'output_file': output_key
         }
 
-        logger.info(f"Quality check completed for {page_spec.business.name} "
-                   f"(Score: {quality_feedback.quality_score:.3f}, "
-                   f"Needs regen: {quality_feedback.needs_regeneration})")
-
+        logger.info(f"Quality control completed: {len(qc_results) - failed_qc}/{len(generated_pages)} successful")
         return response
 
     except Exception as e:
         error_msg = f"Quality control failed: {str(e)}"
         logger.error(error_msg)
 
+        # Try to update pipeline status
+        try:
+            if 'pipeline_status' in locals():
+                pipeline_status.stage = 'failed'
+                pipeline_status.errors.append(error_msg)
+                s3_manager.save_pipeline_status(processed_bucket, pipeline_status)
+        except Exception as status_error:
+            logger.error(f"Failed to save pipeline status: {str(status_error)}")
+
         return {
             'statusCode': 500,
-            'business_id': event.get('business_id', 'unknown'),
             'error': error_msg,
-            'quality_score': 0.0,
-            'retry_count': event.get('retry_count', 0) + 1
+            'execution_id': event.get('execution_id', context.aws_request_id)
         }
 
 
-def perform_quality_assessment(bedrock_client: BedrockClient, page_spec: PageSpec,
-                              seo_validator: SEOValidator, retry_count: int = 0) -> Tuple[Optional[QualityFeedback], GenerationTrace]:
+def combine_assessments(ai_feedback: QualityFeedback, seo_violations: List[str]) -> QualityFeedback:
     """
-    Perform comprehensive quality assessment of generated content.
+    Combine AI-powered quality feedback with technical SEO validation.
 
     Args:
-        bedrock_client: Bedrock client instance
-        page_spec: Generated page specification
-        seo_validator: SEO validation instance
-        retry_count: Current retry attempt number
+        ai_feedback: AI-generated quality feedback
+        seo_violations: List of SEO technical violations
 
     Returns:
-        Tuple of (QualityFeedback or None, GenerationTrace)
+        Combined quality feedback
     """
-    start_time = datetime.utcnow()
-
-    # Initialize QC trace
-    qc_trace = GenerationTrace(
-        business_id=page_spec.business.business_id,
-        prompt_version='qc_1.0',
-        model_name=bedrock_client.default_model,
-        generation_time_ms=0,
-        retry_count=retry_count
+    # Start with AI feedback
+    combined_feedback = QualityFeedback(
+        quality_score=ai_feedback.quality_score,
+        passed_checks=ai_feedback.passed_checks.copy(),
+        failed_checks=ai_feedback.failed_checks.copy(),
+        suggestions=ai_feedback.suggestions.copy(),
+        needs_regeneration=ai_feedback.needs_regeneration
     )
 
-    try:
-        # 1. Automated SEO validation
-        seo_results = seo_validator.validate_seo_metadata(page_spec.seo)
-        content_results = seo_validator.validate_content(page_spec.content, page_spec.business)
+    # Add SEO violations to failed checks
+    for violation in seo_violations:
+        combined_feedback.failed_checks.append(f"SEO: {violation}")
 
-        # Combine automated checks
-        automated_checks = {**seo_results, **content_results}
-        passed_checks = [check for check, result in automated_checks.items() if result]
-        failed_checks = [check for check, result in automated_checks.items() if not result]
+    # Adjust quality score based on SEO violations
+    if seo_violations:
+        seo_penalty = min(0.1 * len(seo_violations), 0.4)  # Max 40% penalty
+        combined_feedback.quality_score = max(0.0, combined_feedback.quality_score - seo_penalty)
 
-        qc_trace.quality_checks.extend([f"Automated check - {check}: {result}" for check, result in automated_checks.items()])
+        # Add suggestions for SEO fixes
+        combined_feedback.suggestions.extend([
+            f"Fix SEO violation: {violation}" for violation in seo_violations[:3]
+        ])
 
-        # 2. LLM-based quality assessment
-        llm_feedback = None
-        try:
-            llm_feedback, llm_trace = perform_llm_quality_check(bedrock_client, page_spec)
-            qc_trace.generation_time_ms += llm_trace.generation_time_ms
-            qc_trace.token_count = (qc_trace.token_count or 0) + (llm_trace.token_count or 0)
-            qc_trace.errors.extend(llm_trace.errors)
-        except Exception as e:
-            logger.warning(f"LLM quality check failed: {str(e)}")
-            qc_trace.errors.append(f"LLM QC failed: {str(e)}")
+    # Determine if regeneration is needed based on combined assessment
+    if (combined_feedback.quality_score < 0.7 or
+        len(seo_violations) > 2 or
+        len(combined_feedback.failed_checks) > 5):
+        combined_feedback.needs_regeneration = True
 
-        # 3. Calculate composite quality score
-        automated_score = calculate_quality_score(automated_checks)
-        llm_score = llm_feedback.get('quality_score', automated_score) if llm_feedback else automated_score
-
-        # Weight: 60% automated, 40% LLM assessment
-        composite_score = round((automated_score * 0.6) + (llm_score * 0.4), 3)
-
-        # 4. Generate improvement suggestions
-        suggestions = seo_validator.suggest_improvements(seo_results, content_results)
-
-        # Add LLM suggestions if available
-        if llm_feedback and 'suggestions' in llm_feedback:
-            suggestions.extend(llm_feedback['suggestions'])
-
-        # Remove duplicates while preserving order
-        suggestions = list(dict.fromkeys(suggestions))
-
-        # 5. Create quality feedback
-        quality_feedback = QualityFeedback(
-            quality_score=composite_score,
-            passed_checks=passed_checks,
-            failed_checks=failed_checks,
-            suggestions=suggestions[:10],  # Limit to top 10 suggestions
-            retry_count=retry_count,
-            needs_regeneration=composite_score < 0.8
-        )
-
-        # Record successful assessment
-        end_time = datetime.utcnow()
-        qc_trace.generation_time_ms = int((end_time - start_time).total_seconds() * 1000)
-        qc_trace.quality_checks.append(f"Quality assessment completed - Score: {composite_score}")
-
-        logger.info(f"Quality assessment completed for {page_spec.business.business_id} "
-                   f"(Automated: {automated_score:.3f}, LLM: {llm_score:.3f}, Composite: {composite_score:.3f})")
-
-        return quality_feedback, qc_trace
-
-    except Exception as e:
-        error_msg = f"Quality assessment error: {str(e)}"
-        qc_trace.errors.append(error_msg)
-        logger.error(error_msg)
-        return None, qc_trace
+    return combined_feedback
 
 
-def perform_llm_quality_check(bedrock_client: BedrockClient, page_spec: PageSpec) -> Tuple[Optional[Dict[str, Any]], GenerationTrace]:
+def calculate_content_metrics(page_spec: PageSpec) -> Dict[str, Any]:
     """
-    Use LLM to perform detailed quality assessment.
+    Calculate various content quality metrics.
 
     Args:
-        bedrock_client: Bedrock client instance
-        page_spec: Page specification to assess
+        page_spec: Page specification to analyze
 
     Returns:
-        Tuple of (quality assessment dict or None, GenerationTrace)
+        Dictionary of content metrics
     """
-    try:
-        # Generate quality check prompt
-        qc_prompt = get_quality_check_prompt(page_spec)
+    content = page_spec.get('content', {})
+    seo = page_spec.get('seo', {})
 
-        # Use Claude for quality assessment
-        response_data, trace = bedrock_client.quality_check_content(
-            content_data=page_spec.dict(),
-            business_id=page_spec.business.business_id,
-            model_name='claude-3-sonnet'  # Use Sonnet for more detailed QC
-        )
+    # Basic content metrics
+    word_count = len(content.get('main_content', '').split())
 
-        if response_data:
-            logger.info(f"LLM quality check completed for {page_spec.business.business_id}")
-            return response_data, trace
-        else:
-            logger.warning(f"LLM quality check returned no data for {page_spec.business.business_id}")
-            return None, trace
+    # Character counts
+    title_length = len(seo.get('title', ''))
+    meta_length = len(seo.get('meta_description', ''))
+    h1_length = len(seo.get('h1', ''))
 
-    except Exception as e:
-        logger.error(f"LLM quality check failed: {str(e)}")
-        # Return empty trace with error
-        trace = GenerationTrace(
-            business_id=page_spec.business.business_id,
-            prompt_version='qc_llm_1.0',
-            model_name='claude-3-sonnet',
-            generation_time_ms=0,
-            errors=[str(e)]
-        )
-        return None, trace
+    # Keyword analysis
+    keywords = seo.get('keywords', [])
+    keyword_density = {}
+    content_lower = content.get('main_content', '').lower()
+
+    for keyword in keywords:
+        count = content_lower.count(keyword.lower())
+        density = (count / word_count) * 100 if word_count > 0 else 0
+        keyword_density[keyword] = round(density, 2)
+
+    return {
+        'word_count': word_count,
+        'title_length': title_length,
+        'meta_length': meta_length,
+        'h1_length': h1_length,
+        'keyword_count': len(keywords),
+        'keyword_density': keyword_density,
+        'internal_links': len(content.get('internal_links', [])) if content.get('internal_links') else 0
+    }
 
 
-def format_feedback_for_regeneration(quality_feedback: QualityFeedback) -> str:
+def generate_improvement_suggestions(page_spec: PageSpec, violations: List[str]) -> List[str]:
     """
-    Format quality feedback into actionable instructions for content regeneration.
+    Generate specific improvement suggestions based on violations.
 
     Args:
-        quality_feedback: Quality feedback object
+        page_spec: Page specification to improve
+        violations: List of identified violations
 
     Returns:
-        Formatted feedback string for regeneration prompt
+        List of improvement suggestions
     """
-    feedback_parts = []
+    suggestions = []
+    metrics = calculate_content_metrics(page_spec)
 
-    # Add score context
-    feedback_parts.append(f"Current quality score: {quality_feedback.quality_score:.3f}/1.0")
+    # Title suggestions
+    if metrics['title_length'] > 70:
+        suggestions.append("Shorten the page title to 70 characters or less")
+    elif metrics['title_length'] < 10:
+        suggestions.append("Expand the page title to at least 10 characters")
 
-    # Add failed checks
-    if quality_feedback.failed_checks:
-        feedback_parts.append("\nISSUES TO ADDRESS:")
-        for i, check in enumerate(quality_feedback.failed_checks[:5], 1):
-            feedback_parts.append(f"{i}. {check.replace('_', ' ').title()}")
+    # Meta description suggestions
+    if metrics['meta_length'] > 160:
+        suggestions.append("Shorten the meta description to 160 characters or less")
+    elif metrics['meta_length'] < 50:
+        suggestions.append("Expand the meta description to at least 50 characters")
 
-    # Add specific suggestions
-    if quality_feedback.suggestions:
-        feedback_parts.append("\nSPECIFIC IMPROVEMENTS:")
-        for i, suggestion in enumerate(quality_feedback.suggestions[:5], 1):
-            feedback_parts.append(f"{i}. {suggestion}")
+    # Content length suggestions
+    if metrics['word_count'] < 800:
+        needed_words = 800 - metrics['word_count']
+        suggestions.append(f"Add approximately {needed_words} more words to reach minimum content length")
 
-    # Add general guidance
-    feedback_parts.append("\nGENERAL GUIDANCE:")
-    feedback_parts.append("- Ensure all SEO requirements are met (title length, meta description, word count)")
-    feedback_parts.append("- Make content more engaging and specific to the business")
-    feedback_parts.append("- Include more local SEO elements and geographic references")
-    feedback_parts.append("- Improve content structure and readability")
+    # Keyword suggestions
+    for keyword, density in metrics['keyword_density'].items():
+        if density > 3.0:
+            suggestions.append(f"Reduce keyword density for '{keyword}' (currently {density}%)")
+        elif density < 0.5:
+            suggestions.append(f"Increase keyword usage for '{keyword}' (currently {density}%)")
 
-    return "\n".join(feedback_parts)
+    # Internal linking suggestions
+    if metrics['internal_links'] == 0:
+        suggestions.append("Add 1-3 internal links to related pages")
+    elif metrics['internal_links'] > 5:
+        suggestions.append("Reduce number of internal links to 3-5 maximum")
 
-
-def calculate_content_score(page_spec: PageSpec) -> Dict[str, float]:
-    """
-    Calculate detailed scoring for different content aspects.
-
-    Args:
-        page_spec: Page specification to score
-
-    Returns:
-        Dictionary with detailed scores
-    """
-    scores = {}
-
-    # SEO technical score
-    seo = page_spec.seo
-    seo_checks = {
-        'title_length': 10 <= len(seo.title) <= 70,
-        'meta_length': 50 <= len(seo.meta_description) <= 160,
-        'h1_length': 10 <= len(seo.h1) <= 70,
-        'has_keywords': len(seo.keywords) >= 3,
-        'slug_valid': len(seo.slug) > 0 and '-' in seo.slug
-    }
-    scores['seo_technical'] = sum(seo_checks.values()) / len(seo_checks)
-
-    # Content quality score
-    content = page_spec.content
-    word_count = len(content.main_content.split())
-    content_checks = {
-        'sufficient_length': word_count >= 800,
-        'has_introduction': len(content.introduction) >= 100,
-        'has_conclusion': len(content.conclusion) >= 100,
-        'mentions_business': page_spec.business.name.lower() in content.main_content.lower(),
-        'mentions_location': page_spec.business.city.lower() in content.main_content.lower()
-    }
-    scores['content_quality'] = sum(content_checks.values()) / len(content_checks)
-
-    # Local relevance score
-    business = page_spec.business
-    full_content = (content.introduction + ' ' + content.main_content + ' ' + content.conclusion).lower()
-    local_checks = {
-        'mentions_city': business.city.lower() in full_content,
-        'mentions_state': business.state.lower() in full_content,
-        'mentions_category': business.category.lower() in full_content,
-        'has_address_info': any(addr_part in full_content for addr_part in business.address.lower().split()),
-        'local_keywords': any(f"{business.city.lower()} {business.category.lower()}" in full_content for _ in [1])
-    }
-    scores['local_relevance'] = sum(local_checks.values()) / len(local_checks)
-
-    # Overall score
-    scores['overall'] = (
-        scores['seo_technical'] * 0.3 +
-        scores['content_quality'] * 0.4 +
-        scores['local_relevance'] * 0.3
-    )
-
-    return {k: round(v, 3) for k, v in scores.items()}
+    return suggestions[:5]  # Limit to top 5 suggestions
